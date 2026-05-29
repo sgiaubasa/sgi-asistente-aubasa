@@ -36,17 +36,23 @@ st.set_page_config(
 )
 
 # ─── CONSTANTES ──────────────────────────────────────────────────────────────
-LISTA_MAESTRA_PATH   = Path("lista_maestra.json")
-ANALISIS_PATH        = Path("analisis_documentos.json")
-REVISIONES_PATH      = Path("revisiones.json")
-SUGERENCIAS_NUE_PATH = Path("sugerencias_nuevos.json")
-INCONGRUENCIAS_PATH  = Path("incongruencias.json")
-AGENDA_PATH          = Path("agenda_sgi.json")
-HALLAZGOS_PATH       = Path("hallazgos_auditoria.json")
-INDICADORES_PATH     = Path("indicadores_sgi.json")
-RIESGOS_PATH         = Path("riesgos_sectores.json")
-CHECKLIST_PATH       = Path("checklist_cargas.json")
-CHROMA_PATH          = "./chroma_db"
+# DATA_DIR: carpeta compartida entre PCs (ej: Google Drive).
+# Si no se define en .env, usa la carpeta del script (comportamiento original).
+_DATA_DIR = Path(os.environ.get("DATA_DIR", "")).expanduser() if os.environ.get("DATA_DIR") else Path(__file__).parent
+if not _DATA_DIR.exists():
+    _DATA_DIR = Path(__file__).parent  # fallback si la ruta no existe
+
+LISTA_MAESTRA_PATH   = _DATA_DIR / "lista_maestra.json"
+ANALISIS_PATH        = _DATA_DIR / "analisis_documentos.json"
+REVISIONES_PATH      = _DATA_DIR / "revisiones.json"
+SUGERENCIAS_NUE_PATH = _DATA_DIR / "sugerencias_nuevos.json"
+INCONGRUENCIAS_PATH  = _DATA_DIR / "incongruencias.json"
+AGENDA_PATH          = _DATA_DIR / "agenda_sgi.json"
+HALLAZGOS_PATH       = _DATA_DIR / "hallazgos_auditoria.json"
+INDICADORES_PATH     = _DATA_DIR / "indicadores_sgi.json"
+RIESGOS_PATH         = _DATA_DIR / "riesgos_sectores.json"
+CHECKLIST_PATH       = _DATA_DIR / "checklist_cargas.json"
+CHROMA_PATH          = str(Path(__file__).parent / "chroma_db")  # siempre local
 CHROMA_COLLECTION    = "sgi_documentos"
 
 CHUNK_SIZE       = 700
@@ -2344,10 +2350,89 @@ def tab_sgi_operativo(lista_maestra: list, analisis_cache: dict):
 
     # ── SUB-TAB 1: CHECKLIST ─────────────────────────────────────────────────
     with ot1:
+        # ── Detección automática de coincidencias ─────────────────────────────
+        def _detectar_match(req: dict, activos: list, analisis_cache: dict,
+                            checklist_cargas: dict) -> str:
+            """Devuelve el nombre del doc cargado que mejor coincide con el requerido, o ''."""
+            # 1) match manual ya guardado
+            guardado = checklist_cargas.get(req["id"], {}).get("doc_nombre", "")
+            if guardado and any(d["nombre"] == guardado for d in activos):
+                return guardado
+            # 2) match por nombre (palabras significativas >=4 chars, al menos 2 coinciden)
+            kws = [w for w in req["nombre"].lower().split() if len(w) >= 4][:4]
+            best = ("", 0)
+            for d in activos:
+                score = sum(1 for kw in kws if kw in d["nombre"].lower())
+                tipo_req  = req.get("tipo","").lower()
+                doc_id    = d.get("id") or d.get("hash","")
+                tipo_doc  = (analisis_cache.get(doc_id,{}) or {}).get("tipo","").lower()
+                if tipo_req and tipo_doc and tipo_req in tipo_doc:
+                    score += 1  # bonus por tipo coincidente
+                # 3) match por cláusula ISO (si analisis_cache tiene la cláusula)
+                ac = analisis_cache.get(doc_id, {}) or {}
+                cl9 = str(ac.get("iso9001","")).strip()
+                cl39 = str(ac.get("iso39001","")).strip()
+                if req["clausula_9001"] and req["clausula_9001"] in (cl9, cl39):
+                    score += 2  # bonus fuerte por cláusula exacta
+                if score > best[1]:
+                    best = (d["nombre"], score)
+            return best[0] if best[1] >= 2 else ""
+
+        # Tabla resumen de detección (arriba del todo)
+        detectados = {}
+        for req in DOCS_REQUERIDOS_SGI:
+            m = _detectar_match(req, activos, analisis_cache, checklist_cargas)
+            detectados[req["id"]] = m
+
+        n_det  = sum(1 for v in detectados.values() if v)
+        n_miss = len(DOCS_REQUERIDOS_SGI) - n_det
+
+        da, db = st.columns(2)
+        with da:
+            st.markdown(
+                f'<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;'
+                f'padding:12px 16px;text-align:center">'
+                f'<div style="font-size:1.8rem;font-weight:700;color:#16a34a">{n_det}</div>'
+                f'<div style="font-size:.82rem;color:#15803d">✅ Documentos detectados<br>'
+                f'en tus archivos cargados</div></div>',
+                unsafe_allow_html=True)
+        with db:
+            st.markdown(
+                f'<div style="background:#fff1f2;border:1px solid #fca5a5;border-radius:10px;'
+                f'padding:12px 16px;text-align:center">'
+                f'<div style="font-size:1.8rem;font-weight:700;color:#dc2626">{n_miss}</div>'
+                f'<div style="font-size:.82rem;color:#b91c1c">⭕ Documentos faltantes<br>'
+                f'que deberías tener</div></div>',
+                unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Tabla compacta de detección
+        with st.expander("📎 Ver tabla de detección automática", expanded=True):
+            rows_det  = [(r["nombre"], detectados[r["id"]], r["clausula_9001"])
+                         for r in DOCS_REQUERIDOS_SGI if detectados[r["id"]]]
+            rows_miss = [(r["nombre"], r["clausula_9001"], r["tipo"])
+                         for r in DOCS_REQUERIDOS_SGI if not detectados[r["id"]]]
+
+            if rows_det:
+                st.markdown("**✅ Encontrados en tu repositorio:**")
+                tbl = "| Documento requerido | Archivo vinculado | Cláusula |\n|---|---|---|\n"
+                for rnom, dnom, cl in rows_det:
+                    tbl += f"| {rnom} | 📄 {dnom} | {cl} |\n"
+                st.markdown(tbl)
+
+            if rows_miss:
+                st.markdown("**⭕ Faltan en tu repositorio:**")
+                tbl2 = "| Documento requerido | Cláusula | Tipo |\n|---|---|---|\n"
+                for rnom, cl, tp in rows_miss:
+                    tbl2 += f"| ❌ {rnom} | {cl} | {tp} |\n"
+                st.markdown(tbl2)
+
+        st.markdown("---")
         st.markdown(
             '<div class="card-info" style="color:#1e293b!important;font-size:.84rem">'
-            'Lista de todos los documentos <b>obligatorios</b> según ISO 9001:2015 e ISO 39001:2015. '
-            'Indicá cuándo cargaste cada uno para calcular vencimientos automáticamente.</div>',
+            '⬇️ Revisá cada documento, vinculalo manualmente si no fue detectado '
+            'y registrá la fecha de última revisión para calcular vencimientos.</div>',
             unsafe_allow_html=True,
         )
 
@@ -2366,15 +2451,8 @@ def tab_sgi_operativo(lista_maestra: list, analisis_cache: dict):
         for req in docs_filtrados:
             carga = checklist_cargas.get(req["id"], {})
             fecha_str = carga.get("fecha_carga", "")
-            doc_vinculado = carga.get("doc_nombre", "")
-
-            # Detectar si hay un doc cargado que coincida automáticamente
-            if not doc_vinculado:
-                for d in activos:
-                    kws = req["nombre"].lower().split()[:3]
-                    if sum(1 for kw in kws if kw in d["nombre"].lower()) >= 2:
-                        doc_vinculado = d["nombre"]
-                        break
+            # Usar detección inteligente
+            doc_vinculado = detectados.get(req["id"], "")
 
             # Calcular estado
             alerta = False; vencido = False; dias_restantes = None
@@ -2644,7 +2722,7 @@ def tab_sgi_operativo(lista_maestra: list, analisis_cache: dict):
                     ind_periodo = st.text_input("Período", placeholder="Ej: Q1 2026")
                     ind_claus   = st.text_input("Cláusula ISO", placeholder="Ej: 9.1 / 8.4")
                     ind_resp    = st.text_input("Responsable", placeholder="Área o persona")
-                ind_obs = st.text_area("Observaciones", height=60)
+                ind_obs = st.text_area("Observaciones", height=68)
                 if st.form_submit_button("💾 Guardar indicador", type="primary", use_container_width=True):
                     if ind_nombre.strip():
                         # Actualizar si ya existe
