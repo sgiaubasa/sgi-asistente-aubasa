@@ -241,5 +241,32 @@
     "iso39001": "No aplica",
     "estado": "activo",
     "fecha_ingreso": "2026-05-24"
+  },
+  {
+    "hash": "5e9276e9",
+    "nombre": "AUBASA PAU-03 Liderazgo REV.01 (10-08-2023).pdf",
+    "tipo": "Procedimiento",
+    "iso9001": "Liderazgo, Enfoque al cliente, Política, Objetivos, Gestión de recursos, Medición, análisis y mejora",
+    "iso39001": "Liderazgo y compromiso, Enfoque al usuario, Gestión de la seguridad vial, Reducción y eliminación de muertes y lesiones graves derivadas de siniestros viales",
+    "estado": "activo",
+    "fecha_ingreso": "2026-05-29"
+  },
+  {
+    "hash": "a4b969cf",
+    "nombre": "ANEXO 1 Organigrama Rev.03.pdf",
+    "tipo": "Registro",
+    "iso9001": "Capítulo 7: Soporte, 8.1: Planificación y control de los procesos, 8.3: Diseño y desarrollo de los productos y servicios, 9.3: Revisión del sistema de gestión",
+    "iso39001": "No aplica",
+    "estado": "activo",
+    "fecha_ingreso": "2026-05-29"
+  },
+  {
+    "hash": "5d37065d",
+    "nombre": "Anexo 2 Perfil y Descripcion de Puesto PAU-03 Rev.02.pdf",
+    "tipo": "Registro",
+    "iso9001": "6. Organización, 7. Soporte, 8. Operación",
+    "iso39001": "No aplica",
+    "estado": "activo",
+    "fecha_ingreso": "2026-05-29"
   }
 ]
