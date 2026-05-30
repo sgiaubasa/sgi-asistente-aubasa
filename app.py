@@ -60,10 +60,75 @@ CHECKLIST_PATH       = _DATA_DIR / "checklist_cargas.json"
 CHROMA_PATH          = str(_DATA_DIR / "chroma_db")  # compartido junto a los datos
 CHROMA_COLLECTION    = "sgi_documentos"
 
+# Carpetas de archivos físicos en Drive
+DOCS_ACTIVOS_PATH   = _DATA_DIR / "documentos" / "activos"
+DOCS_OBSOLETOS_PATH = _DATA_DIR / "documentos" / "obsoletos"
+DOCS_ACTIVOS_PATH.mkdir(parents=True, exist_ok=True)
+DOCS_OBSOLETOS_PATH.mkdir(parents=True, exist_ok=True)
+
 CHUNK_SIZE       = 700
 CHUNK_OVERLAP    = 80
 RAG_TOP_K        = 3
 TEXT_PREVIEW_LEN = 6000
+
+# ─── HELPERS ARCHIVOS FÍSICOS ────────────────────────────────────────────────
+def _guardar_archivo_doc(file_bytes: bytes, filename: str) -> Path | None:
+    """Guarda el archivo en activos/. Convierte a PDF si es posible."""
+    import tempfile, base64 as _b64
+    ext  = Path(filename).suffix.lower()
+    stem = Path(filename).stem
+    dest_pdf  = DOCS_ACTIVOS_PATH / (stem + ".pdf")
+    dest_orig = DOCS_ACTIVOS_PATH / filename
+
+    if ext == ".pdf":
+        dest_orig.write_bytes(file_bytes)
+        return dest_orig
+
+    if ext == ".docx":
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+            tmp.write(file_bytes); tmp_path = Path(tmp.name)
+        try:
+            from docx2pdf import convert
+            convert(str(tmp_path), str(dest_pdf))
+            tmp_path.unlink(missing_ok=True)
+            if dest_pdf.exists(): return dest_pdf
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+
+    # Fallback: guardar original
+    dest_orig.write_bytes(file_bytes)
+    return dest_orig
+
+
+def _mover_a_obsoletos(archivo_path: str) -> str:
+    """Mueve el archivo de activos a obsoletos y devuelve la nueva ruta."""
+    src = Path(archivo_path)
+    if not src.exists(): return archivo_path
+    dest = DOCS_OBSOLETOS_PATH / src.name
+    src.rename(dest)
+    return str(dest)
+
+
+def _show_pdf_viewer(archivo_path: str):
+    """Muestra un visor PDF inline o botón de descarga."""
+    import base64 as _b64
+    p = Path(archivo_path)
+    if not p.exists():
+        st.info("📄 El archivo físico no está disponible (documento cargado antes de esta función).")
+        return
+    ext = p.suffix.lower()
+    if ext == ".pdf":
+        data = _b64.b64encode(p.read_bytes()).decode()
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{data}" '
+            f'width="100%" height="620px" style="border:none;border-radius:8px"></iframe>',
+            unsafe_allow_html=True,
+        )
+    else:
+        with open(p, "rb") as f:
+            st.download_button(f"⬇️ Descargar {p.name}", f, file_name=p.name,
+                               use_container_width=True)
+
 
 # ─── CSS ─────────────────────────────────────────────────────────────────────
 CSS = """
@@ -3022,10 +3087,14 @@ def tab_documentos(lista_maestra: list, analisis_cache: dict, incongruencias: di
         prog.progress(78); index_document(file_bytes, uploaded.name, text)
         st.write("💾 Guardando en Lista Maestra y tracker de incongruencias...")
         prog.progress(92)
+        # Guardar archivo físico en Drive (activos/)
+        st.write("💾 Guardando archivo en Google Drive...")
+        archivo_guardado = _guardar_archivo_doc(file_bytes, uploaded.name)
         entry = {"hash":file_hash,"nombre":uploaded.name,"tipo":classification.get("tipo","Otro"),
                  "iso9001":classification.get("iso9001","No aplica"),
                  "iso39001":classification.get("iso39001","No aplica"),
-                 "estado":"activo","fecha_ingreso":datetime.now().strftime("%Y-%m-%d")}
+                 "estado":"activo","fecha_ingreso":datetime.now().strftime("%Y-%m-%d"),
+                 "archivo_path": str(archivo_guardado) if archivo_guardado else ""}
         lista_maestra.append(entry); save_json(LISTA_MAESTRA_PATH, lista_maestra)
         analisis_cache[uploaded.name] = {**deep, "_texto": text[:TEXT_PREVIEW_LEN]}
         save_json(ANALISIS_PATH, analisis_cache)
@@ -3357,27 +3426,49 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                         f'</div></div>',
                         unsafe_allow_html=True,
                     )
-                    rc1, rc2, rc3 = st.columns([3,2,2])
+                    rc1, rc2, rc3, rc4 = st.columns([2,2,2,2])
                     with rc1:
                         n_inc = sum(1 for v in load_json(INCONGRUENCIAS_PATH,{}).values()
                                     if v.get("documento")==doc["nombre"] and v.get("estado")=="abierta")
                         if n_inc: st.markdown(f'<span class="status-pill st-abierta">⚠️ {n_inc} inc. abierta(s)</span>',
                                               unsafe_allow_html=True)
                     with rc2:
-                        if st.button("👁️ Ver contenido", key=f"view_{doc['hash']}", use_container_width=True):
+                        if st.button("👁️ Ver texto", key=f"view_{doc['hash']}", use_container_width=True):
                             current = st.session_state.get("repo_view_doc")
                             st.session_state["repo_view_doc"] = None if current == doc["nombre"] else doc["nombre"]
+                            st.session_state.pop("repo_pdf_doc", None)
                             st.rerun()
                     with rc3:
+                        archivo_path = doc.get("archivo_path","")
+                        if archivo_path and Path(archivo_path).exists():
+                            if st.button("📄 Ver PDF", key=f"pdf_{doc['hash']}", use_container_width=True):
+                                current = st.session_state.get("repo_pdf_doc")
+                                st.session_state["repo_pdf_doc"] = None if current == doc["nombre"] else doc["nombre"]
+                                st.session_state.pop("repo_view_doc", None)
+                                st.rerun()
+                        else:
+                            st.markdown('<span style="font-size:.72rem;color:#9ca3af">📄 Sin archivo</span>',
+                                        unsafe_allow_html=True)
+                    with rc4:
                         if st.button("📦 Archivar como Obsoleto", key=f"arch_{doc['hash']}", use_container_width=True):
                             for i,d in enumerate(lista_maestra):
                                 if d.get("hash")==doc["hash"]:
                                     lista_maestra[i]["estado"] = "obsoleto"
                                     lista_maestra[i]["fecha_obsolescencia"] = datetime.now().strftime("%Y-%m-%d")
+                                    # Mover archivo físico a obsoletos/
+                                    arch = d.get("archivo_path","")
+                                    if arch:
+                                        lista_maestra[i]["archivo_path"] = _mover_a_obsoletos(arch)
                                     break
                             save_json(LISTA_MAESTRA_PATH, lista_maestra)
                             st.success(f"**{doc['nombre']}** archivado como obsoleto.")
                             st.rerun()
+                    # Visor PDF
+                    if st.session_state.get("repo_pdf_doc") == doc["nombre"]:
+                        st.markdown(f'<div style="font-size:.78rem;font-weight:700;color:#1565c0;'
+                                    f'margin:8px 0 4px">📄 {doc["nombre"]}</div>', unsafe_allow_html=True)
+                        _show_pdf_viewer(doc.get("archivo_path",""))
+
                     # Visor de texto del documento
                     if st.session_state.get("repo_view_doc") == doc["nombre"]:
                         doc_texto = (analisis_cache.get(doc["nombre"], {}).get("_texto", "")
