@@ -3014,14 +3014,20 @@ def render_sidebar(lista_maestra: list, incongruencias: dict):
                         'GROQ_API_KEY=xxx al archivo .env</div>',
                         unsafe_allow_html=True)
         st.markdown("---")
-        # Mostrar dónde se guardan los datos
-        data_dir_label = str(_DATA_DIR)
+        # Sincronización multi-dispositivo
+        mtime = LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
+        from datetime import datetime as _dt
+        ultima_sync = _dt.fromtimestamp(mtime).strftime("%d/%m %H:%M:%S") if mtime else "—"
         st.markdown(
             f'<div style="font-size:.72rem;color:rgba(255,255,255,.7);'
             f'background:rgba(255,255,255,.08);border-radius:6px;padding:6px 10px;'
             f'margin-bottom:4px;word-break:break-all">'
-            f'💾 <b>Datos en:</b><br>{data_dir_label}</div>',
+            f'💾 <b>Datos en:</b><br>{str(_DATA_DIR)}<br>'
+            f'<span style="color:rgba(255,255,255,.5)">📡 Act.: {ultima_sync}</span></div>',
             unsafe_allow_html=True)
+        if st.button("🔄 Sincronizar ahora", use_container_width=True, key="btn_sync"):
+            st.session_state["_data_mtime"] = 0   # fuerza re-lectura
+            st.rerun()
         st.markdown("---")
         st.markdown("### 📊 Estado del Sistema")
         activos  = [d for d in lista_maestra if d.get("estado","activo")=="activo"]
@@ -3760,6 +3766,24 @@ def render_right_panel(lista_maestra: list, analisis_cache: dict):
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
 
+    # ── Auto-refresh: detecta cambios en Drive desde otro dispositivo ────────────
+    mtime_actual = LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
+    mtime_previo = st.session_state.get("_data_mtime", 0)
+    if mtime_actual != mtime_previo:
+        if mtime_previo != 0:   # no es la primera carga → otro dispositivo modificó
+            st.toast("📡 Datos actualizados desde otro dispositivo", icon="🔄")
+        st.session_state["_data_mtime"] = mtime_actual
+
+    # Auto-rerun cada 30 seg para detectar cambios de otros dispositivos
+    import time as _time
+    _now = _time.time()
+    if _now - st.session_state.get("_last_autocheck", 0) > 30:
+        st.session_state["_last_autocheck"] = _now
+        new_mtime = LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
+        if new_mtime != st.session_state.get("_data_mtime", 0):
+            st.session_state["_data_mtime"] = new_mtime
+            st.rerun()
+
     # ── Precarga del motor de embeddings (primera vez muestra spinner y recarga) ──
     if "chroma_ready" not in st.session_state:
         with st.spinner("⚙️ Iniciando motor de búsqueda semántica (~90 MB, solo la primera vez)..."):
@@ -3773,7 +3797,7 @@ def main():
                  ("last_sugerencia",None)]:
         if k not in st.session_state: st.session_state[k] = v
 
-    # Cargar datos
+    # Cargar datos SIEMPRE desde disco (nunca desde caché de sesión)
     lista_maestra: list[dict] = load_json(LISTA_MAESTRA_PATH, [])
     # Migración: agregar campo estado a docs sin él
     changed = False
