@@ -11,18 +11,23 @@ from io import BytesIO
 
 # ─── CARGAR .env AUTOMÁTICAMENTE ─────────────────────────────────────────────
 def _load_dotenv():
-    """Carga variables de .env sin dependencias externas."""
-    env_path = Path(__file__).parent / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """Carga .env: busca primero en H:\Mi unidad\Sgi Asistente\, luego junto al script."""
+    candidates = [
+        Path(r"H:\Mi unidad\Sgi Asistente\.env"),   # Drive SGI compartido
+        Path(__file__).parent / ".env",               # local (fallback)
+    ]
+    for env_path in candidates:
+        if not env_path.exists():
             continue
-        k, _, v = line.partition("=")
-        k = k.strip(); v = v.strip().strip('"').strip("'")
-        if k and k not in os.environ:
-            os.environ[k] = v
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip(); v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+        break  # usa solo el primero que exista
 _load_dotenv()
 
 import streamlit as st
@@ -52,7 +57,7 @@ HALLAZGOS_PATH       = _DATA_DIR / "hallazgos_auditoria.json"
 INDICADORES_PATH     = _DATA_DIR / "indicadores_sgi.json"
 RIESGOS_PATH         = _DATA_DIR / "riesgos_sectores.json"
 CHECKLIST_PATH       = _DATA_DIR / "checklist_cargas.json"
-CHROMA_PATH          = str(Path(__file__).parent / "chroma_db")  # siempre local
+CHROMA_PATH          = str(_DATA_DIR / "chroma_db")  # compartido junto a los datos
 CHROMA_COLLECTION    = "sgi_documentos"
 
 CHUNK_SIZE       = 700
@@ -2943,6 +2948,15 @@ def render_sidebar(lista_maestra: list, incongruencias: dict):
                         'margin-top:2px">👉 groq.com → clave gratis → agregar<br>'
                         'GROQ_API_KEY=xxx al archivo .env</div>',
                         unsafe_allow_html=True)
+        st.markdown("---")
+        # Mostrar dónde se guardan los datos
+        data_dir_label = str(_DATA_DIR)
+        st.markdown(
+            f'<div style="font-size:.72rem;color:rgba(255,255,255,.7);'
+            f'background:rgba(255,255,255,.08);border-radius:6px;padding:6px 10px;'
+            f'margin-bottom:4px;word-break:break-all">'
+            f'💾 <b>Datos en:</b><br>{data_dir_label}</div>',
+            unsafe_allow_html=True)
         st.markdown("---")
         st.markdown("### 📊 Estado del Sistema")
         activos  = [d for d in lista_maestra if d.get("estado","activo")=="activo"]
