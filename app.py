@@ -1,13 +1,20 @@
 """
-Asistente de Auditoría SGI — v3.0
+Asistente de Auditoría SGI — v4.0
 ISO 9001:2015 / ISO 39001:2015
-Stack: Streamlit · ChromaDB · Gemini 2.5 Flash · all-MiniLM-L6-v2 · python-docx
+Stack: Streamlit · Pinecone · Supabase · Gemini 2.5 Flash · python-docx
 """
 
 import os, json, hashlib, tempfile, uuid
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
+
+# ── Cloud storage (Supabase + Pinecone) ───────────────────────────────────────
+from storage import (
+    load_data, save_data,
+    vector_upsert, vector_query, vector_delete, vector_count,
+    verificar_login, listar_usuarios, crear_usuario, eliminar_usuario
+)
 
 # ─── CARGAR .env AUTOMÁTICAMENTE ─────────────────────────────────────────────
 def _load_dotenv():
@@ -321,6 +328,12 @@ div[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar-thumb:hover {
 
 # ─── JSON HELPERS ─────────────────────────────────────────────────────────────
 def load_json(path: Path, default):
+    """Lee desde Supabase (cloud) con fallback a archivo local."""
+    key = path.stem  # ej: "lista_maestra"
+    data = load_data(key, None)
+    if data is not None:
+        return data
+    # fallback local
     try:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
@@ -329,24 +342,26 @@ def load_json(path: Path, default):
     return default
 
 def save_json(path: Path, data) -> bool:
+    """Guarda en Supabase (cloud) y también localmente como backup."""
+    key = path.stem
+    ok = save_data(key, data)
+    # backup local si es posible
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        return True
-    except Exception as e:
-        st.error(f"Error guardando {path.name}: {e}")
-        return False
+    except Exception:
+        pass
+    return ok
 
-# ─── CHROMADB + EMBEDDINGS ────────────────────────────────────────────────────
+# ─── VECTOR STORE (Pinecone — reemplaza ChromaDB) ────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _init_chroma():
-    import chromadb
-    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-    ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_or_create_collection(
-        name=CHROMA_COLLECTION, embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+    """Mantiene el nombre para compatibilidad pero usa Pinecone."""
+    from storage import _pinecone_index
+    return _pinecone_index()
+
+def get_collection():
+    """Compatibilidad — retorna índice Pinecone."""
+    return _init_chroma()
 
 def get_collection():
     return _init_chroma()
@@ -1243,19 +1258,14 @@ Respuesta técnica y accionable."""
     return _call_gemini(prompt) or "Error al analizar riesgos."
 
 
-# ─── RAG QUERY ────────────────────────────────────────────────────────────────
+# ─── RAG QUERY (Pinecone) ─────────────────────────────────────────────────────
 def rag_query(question: str) -> str:
-    col = get_collection()
-    total = col.count()
+    total = vector_count()
     if total == 0:
         return "No hay documentos indexados. Suba archivos primero."
-    try:
-        results = col.query(query_texts=[question], n_results=min(RAG_TOP_K, total))
-        docs, metas = results["documents"][0], results["metadatas"][0]
-    except Exception as e:
-        return f"Error en búsqueda vectorial: {e}"
-    if not docs: return "No se encontraron fragmentos relevantes."
-    context = "\n\n---\n\n".join(f"[{m.get('source','?')}]\n{d}" for d, m in zip(docs, metas))
+    context = vector_query(question, top_k=RAG_TOP_K)
+    if not context:
+        return "No se encontraron fragmentos relevantes."
     if not os.environ.get("GEMINI_API_KEY"):
         return "**Fragmentos encontrados (configure GEMINI_API_KEY para respuesta interpretada):**\n\n" + context
     prompt = f"""Eres Asistente de Auditoría SGI experto en ISO 9001:2015 e ISO 39001:2015.
@@ -1267,21 +1277,19 @@ FRAGMENTOS:
 PREGUNTA: {question}"""
     answer = _call_gemini(prompt)
     if answer:
-        sources = ", ".join({m.get("source","?") for m in metas})
-        return f"{answer}\n\n*📁 Fuentes: {sources}*"
+        return f"{answer}\n\n*📁 Fuente: documentos SGI indexados*"
     return "Error generando respuesta."
 
 
-# ─── CHROMADB INDEXING ────────────────────────────────────────────────────────
+# ─── PINECONE INDEXING ────────────────────────────────────────────────────────
 def index_document(file_bytes: bytes, filename: str, text: str) -> None:
     fhash = hashlib.md5(file_bytes).hexdigest()[:8]
     chunks = chunk_text(text)
     if not chunks: return
-    col = get_collection()
-    ids  = [f"{fhash}_{i}" for i in range(len(chunks))]
-    meta = [{"source":filename,"chunk_idx":i,"hash":fhash} for i in range(len(chunks))]
-    try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
-    except Exception as e: st.warning(f"ChromaDB: {e}")
+    try:
+        vector_upsert(doc_id=fhash, chunks=chunks, source=filename)
+    except Exception as e:
+        st.warning(f"Pinecone: {e}")
 
 
 # ─── GESTIÓN DE INCONGRUENCIAS ────────────────────────────────────────────────
@@ -3763,8 +3771,48 @@ def render_right_panel(lista_maestra: list, analisis_cache: dict):
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
+def _render_login():
+    """Pantalla de login. Retorna True si el usuario está autenticado."""
+    if st.session_state.get("sgi_user"):
+        return True
+
+    st.markdown(CSS, unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.markdown("""
+        <div style="text-align:center;padding:40px 0 20px">
+            <div style="font-size:52px">🏛️</div>
+            <h2 style="color:#1565c0;margin:8px 0 4px">Asistente SGI</h2>
+            <p style="color:#666;font-size:14px">AUBASA · ISO 9001/39001</p>
+        </div>""", unsafe_allow_html=True)
+
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="usuario@aubasa.com")
+            password = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Ingresar", use_container_width=True)
+
+        if submitted:
+            if not email or not password:
+                st.error("Completá email y contraseña")
+            else:
+                user = verificar_login(email.strip(), password.strip())
+                if user:
+                    st.session_state["sgi_user"] = user
+                    st.rerun()
+                else:
+                    st.error("Email o contraseña incorrectos")
+    return False
+
+
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
+
+    # ── LOGIN ─────────────────────────────────────────────────────────────────
+    if not _render_login():
+        return
+
+    user = st.session_state["sgi_user"]
+    es_admin = user.get("rol") == "admin"
 
     # ── Auto-refresh: detecta cambios en Drive desde otro dispositivo ────────────
     mtime_actual = LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
@@ -3841,6 +3889,23 @@ def main():
     with st.sidebar:
         st.markdown("---")
         render_right_panel(lista_maestra, analisis_cache)
+
+    # Botón salir en sidebar
+    with st.sidebar:
+        st.markdown(f"**👤 {user.get('nombre', user.get('email'))}**")
+        st.caption(f"Rol: {'Administrador' if es_admin else 'Usuario'}")
+        if st.button("🚪 Cerrar sesión"):
+            st.session_state.pop("sgi_user", None)
+            st.rerun()
+
+    # ── Usuarios normales: solo chatbot ───────────────────────────────────────
+    if not es_admin:
+        st.markdown("""<div class="sgi-header">
+            <h1>🏛️ Asistente SGI · AUBASA</h1>
+            <p>Consultá sobre documentos, procesos e ISO 9001/39001</p>
+        </div>""", unsafe_allow_html=True)
+        tab_chatbot(lista_maestra)
+        return
 
     tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10 = st.tabs([
         "📂  Documentos",
