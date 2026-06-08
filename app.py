@@ -1,7 +1,9 @@
 """
 Asistente de Auditoría SGI — v3.0
 ISO 9001:2015 / ISO 39001:2015
-Stack: Streamlit · buscador semántico propio (numpy) · Gemini · python-docx
+Stack: Streamlit · Gemini · python-docx
+Persistencia: Supabase (datos + archivos) + Pinecone (búsqueda semántica) en la nube
+              — con fallback a archivos locales/Drive + buscador propio (numpy) en local
 """
 
 import os, json, hashlib, tempfile, uuid, threading
@@ -58,10 +60,10 @@ HALLAZGOS_PATH       = _DATA_DIR / "hallazgos_auditoria.json"
 INDICADORES_PATH     = _DATA_DIR / "indicadores_sgi.json"
 RIESGOS_PATH         = _DATA_DIR / "riesgos_sectores.json"
 CHECKLIST_PATH       = _DATA_DIR / "checklist_cargas.json"
-# Buscador semántico propio y liviano (reemplaza a ChromaDB — ver LiteVectorStore):
-# ChromaDB arrastra ~125 MB de dependencias pesadas (onnxruntime, kubernetes, pyarrow,
-# grpc, fastapi...) que no se necesitan para una colección local de pocas decenas de
-# fragmentos, y eso agotaba la RAM/tiempo de build del hosting (Render free tier: 512 MB).
+# Ruta del índice del buscador semántico LOCAL (LiteVectorStore: numpy + JSON).
+# Solo se usa como fallback cuando no hay credenciales de Pinecone configuradas
+# (uso local con DATA_DIR en Drive). En Render se usa Pinecone (índice en la nube,
+# persistente — ver PineconeVectorStore/_init_vector_store) y este archivo no se toca.
 # v2: nuevo archivo porque cambia la dimensionalidad del vector al pasar de
 # sentence-transformers (384) a la API de embeddings de Gemini (768)
 VECTOR_STORE_PATH    = _DATA_DIR / "vector_store_v2.json"
@@ -82,63 +84,164 @@ CHUNK_OVERLAP    = 80
 RAG_TOP_K        = 3
 TEXT_PREVIEW_LEN = 6000
 
-# ─── HELPERS ARCHIVOS FÍSICOS ────────────────────────────────────────────────
-def _guardar_archivo_doc(file_bytes: bytes, filename: str) -> Path | None:
-    """Guarda el archivo en activos/. Convierte a PDF si es posible."""
-    import tempfile, base64 as _b64
+# ─── ALMACENAMIENTO DE ARCHIVOS FÍSICOS (Drive local / Supabase Storage) ─────
+# En Render el filesystem es efímero (se borra en cada redeploy/reinicio), así
+# que los archivos físicos (PDFs, etc.) se guardan en un bucket de Supabase
+# Storage cuando hay credenciales configuradas — persistente y gratuito. La
+# referencia se guarda en "archivo_path" con el prefijo "sb://" para poder
+# distinguirla de una ruta local de Drive (compatibilidad con datos existentes).
+SUPABASE_BUCKET = "documentos"
+
+def _storage_bucket():
+    sb = _supabase_client()
+    if sb is None:
+        return None
+    try:
+        return sb.storage.from_(SUPABASE_BUCKET)
+    except Exception as e:
+        print(f"[Supabase Storage] no se pudo acceder al bucket '{SUPABASE_BUCKET}': {e}")
+        return None
+
+def _carpeta_local(carpeta: str) -> Path:
+    return {"activos": DOCS_ACTIVOS_PATH, "obsoletos": DOCS_OBSOLETOS_PATH,
+            "normas": NORMAS_PATH}.get(carpeta, DOCS_ACTIVOS_PATH)
+
+def _safe_storage_key(name: str) -> str:
+    """Sanea un nombre de archivo para usarlo como clave de objeto en Supabase
+    Storage, que solo admite un set ASCII reducido (rechaza tildes/ñ/comas/etc.
+    con 'Invalid key'): quita acentos y reemplaza cualquier carácter fuera de
+    [A-Za-z0-9._-] por '_'. El nombre original se conserva igual en 'nombre' de
+    la lista maestra; esto solo afecta a la clave interna del bucket."""
+    import unicodedata, re as _re
+    norm = unicodedata.normalize("NFKD", name)
+    ascii_name = norm.encode("ascii", "ignore").decode("ascii")
+    return _re.sub(r"[^A-Za-z0-9._-]", "_", ascii_name) or "archivo"
+
+def _file_save(carpeta: str, filename: str, data: bytes) -> str:
+    """Guarda bytes bajo carpeta/filename y devuelve la referencia a persistir
+    como 'archivo_path': clave 'sb://carpeta/archivo' en Supabase Storage (Render,
+    persistente) o ruta local en Drive (uso local, comportamiento original)."""
+    bucket = _storage_bucket()
+    if bucket is not None:
+        key = f"{carpeta}/{_safe_storage_key(filename)}"
+        try:
+            try:
+                bucket.upload(key, data, {"upsert": "true"})
+            except TypeError:
+                bucket.upload(key, data, {"x-upsert": "true"})
+            return f"sb://{key}"
+        except Exception as e:
+            print(f"[Supabase Storage] error subiendo '{key}', uso filesystem local: {e}")
+    dest = _carpeta_local(carpeta) / filename
+    dest.write_bytes(data)
+    return str(dest)
+
+def _file_read(ref: str) -> bytes | None:
+    """Lee los bytes de un archivo a partir de su referencia ('sb://...' o ruta local)."""
+    if not ref:
+        return None
+    if ref.startswith("sb://"):
+        bucket = _storage_bucket()
+        if bucket is None:
+            return None
+        try:
+            return bucket.download(ref[len("sb://"):])
+        except Exception as e:
+            print(f"[Supabase Storage] error descargando '{ref}': {e}")
+            return None
+    p = Path(ref)
+    return p.read_bytes() if p.exists() else None
+
+def _file_exists(ref: str) -> bool:
+    if not ref:
+        return False
+    if ref.startswith("sb://"):
+        return True  # confiamos en la referencia guardada; _file_read informa si falla
+    return Path(ref).exists()
+
+def _file_name(ref: str) -> str:
+    key = ref[len("sb://"):] if ref.startswith("sb://") else ref
+    return Path(key).name
+
+def _file_delete(ref: str) -> None:
+    if not ref:
+        return
+    if ref.startswith("sb://"):
+        bucket = _storage_bucket()
+        if bucket is not None:
+            try: bucket.remove([ref[len("sb://"):]])
+            except Exception: pass
+    else:
+        try: Path(ref).unlink(missing_ok=True)
+        except Exception: pass
+
+
+def _guardar_archivo_doc(file_bytes: bytes, filename: str, carpeta: str = "activos") -> str | None:
+    """Guarda el archivo físico (convertido a PDF si es posible) y devuelve su
+    referencia para 'archivo_path' (ver _file_save: Supabase Storage en la nube,
+    filesystem local de Drive en uso local)."""
     ext  = Path(filename).suffix.lower()
     stem = Path(filename).stem
-    dest_pdf  = DOCS_ACTIVOS_PATH / (stem + ".pdf")
-    dest_orig = DOCS_ACTIVOS_PATH / filename
 
     if ext == ".pdf":
-        dest_orig.write_bytes(file_bytes)
-        return dest_orig
+        return _file_save(carpeta, filename, file_bytes)
 
     if ext == ".docx":
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             tmp.write(file_bytes); tmp_path = Path(tmp.name)
         try:
             from docx2pdf import convert
-            convert(str(tmp_path), str(dest_pdf))
-            tmp_path.unlink(missing_ok=True)
-            if dest_pdf.exists(): return dest_pdf
+            tmp_pdf = tmp_path.with_suffix(".pdf")
+            convert(str(tmp_path), str(tmp_pdf))
+            if tmp_pdf.exists():
+                pdf_bytes = tmp_pdf.read_bytes()
+                tmp_pdf.unlink(missing_ok=True)
+                tmp_path.unlink(missing_ok=True)
+                return _file_save(carpeta, stem + ".pdf", pdf_bytes)
         except Exception:
-            tmp_path.unlink(missing_ok=True)
+            pass
+        tmp_path.unlink(missing_ok=True)
 
     # Fallback: guardar original
-    dest_orig.write_bytes(file_bytes)
-    return dest_orig
+    return _file_save(carpeta, filename, file_bytes)
 
 
 def _mover_a_obsoletos(archivo_path: str) -> str:
-    """Mueve el archivo de activos a obsoletos y devuelve la nueva ruta."""
-    src = Path(archivo_path)
-    if not src.exists(): return archivo_path
-    dest = DOCS_OBSOLETOS_PATH / src.name
-    src.rename(dest)
-    return str(dest)
+    """Mueve el archivo de activos a obsoletos y devuelve la nueva referencia."""
+    if not archivo_path:
+        return archivo_path
+    data = _file_read(archivo_path)
+    if data is None:
+        return archivo_path
+    nuevo = _file_save("obsoletos", _file_name(archivo_path), data)
+    if nuevo != archivo_path:
+        _file_delete(archivo_path)
+    return nuevo
 
 
 def _show_pdf_viewer(archivo_path: str):
-    """Muestra un visor PDF inline o botón de descarga."""
+    """Muestra un visor PDF inline o botón de descarga, leyendo el archivo desde
+    Supabase Storage o desde el filesystem local según corresponda a la referencia."""
     import base64 as _b64
-    p = Path(archivo_path)
-    if not p.exists():
+    if not archivo_path:
         st.info("📄 El archivo físico no está disponible (documento cargado antes de esta función).")
         return
-    ext = p.suffix.lower()
+    data = _file_read(archivo_path)
+    if data is None:
+        st.info("📄 El archivo físico no está disponible (documento cargado antes de esta función).")
+        return
+    name = _file_name(archivo_path)
+    ext  = Path(name).suffix.lower()
     if ext == ".pdf":
-        data = _b64.b64encode(p.read_bytes()).decode()
+        b64 = _b64.b64encode(data).decode()
         st.markdown(
-            f'<iframe src="data:application/pdf;base64,{data}" '
+            f'<iframe src="data:application/pdf;base64,{b64}" '
             f'width="100%" height="620px" style="border:none;border-radius:8px"></iframe>',
             unsafe_allow_html=True,
         )
     else:
-        with open(p, "rb") as f:
-            st.download_button(f"⬇️ Descargar {p.name}", f, file_name=p.name,
-                               use_container_width=True)
+        st.download_button(f"⬇️ Descargar {name}", data, file_name=name,
+                           use_container_width=True)
 
 
 # ─── CSS ─────────────────────────────────────────────────────────────────────
@@ -330,8 +433,56 @@ div[data-testid="stVerticalBlockBorderWrapper"]::-webkit-scrollbar-thumb:hover {
 </style>
 """
 
+# ─── SUPABASE (persistencia en la nube) ──────────────────────────────────────
+# Render usa un filesystem efímero: todo lo que se escriba en disco se borra en
+# cada redeploy/reinicio. Si hay credenciales de Supabase configuradas (como en
+# Render), los "archivos" JSON de la app se guardan como filas de una tabla
+# key/value (data_store) y los archivos físicos en un bucket de Storage — ambos
+# persistentes. En uso local (con DATA_DIR apuntando a Drive) seguimos usando el
+# filesystem como siempre, sin tocar nada.
+_SB_TABLE = "data_store"
+
+@st.cache_resource(show_spinner=False)
+def _supabase_client():
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(url, key)
+    except Exception as e:
+        print(f"[Supabase] no se pudo inicializar el cliente: {e}")
+        return None
+
+
+def _lista_maestra_version():
+    """'Versión' opaca de la lista maestra — usada solo para detectar cambios desde
+    otra sesión/dispositivo (auto-refresh). En Supabase es el 'updated_at' de la
+    fila; en uso local con archivos, el mtime del archivo. No se interpreta como
+    fecha, solo se compara por igualdad."""
+    sb = _supabase_client()
+    if sb is not None:
+        try:
+            res = sb.table(_SB_TABLE).select("updated_at").eq("key", LISTA_MAESTRA_PATH.stem).limit(1).execute()
+            return res.data[0]["updated_at"] if res.data else ""
+        except Exception:
+            return ""
+    return LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
+
+
 # ─── JSON HELPERS ─────────────────────────────────────────────────────────────
 def load_json(path: Path, default):
+    sb = _supabase_client()
+    if sb is not None:
+        try:
+            res = sb.table(_SB_TABLE).select("value").eq("key", path.stem).limit(1).execute()
+            if res.data:
+                return res.data[0]["value"]
+            return default
+        except Exception as e:
+            print(f"[Supabase] load_json('{path.stem}'): {e}")
+            # si falla, intentamos el filesystem como respaldo (sigue abajo)
     try:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
@@ -340,6 +491,18 @@ def load_json(path: Path, default):
     return default
 
 def save_json(path: Path, data) -> bool:
+    sb = _supabase_client()
+    if sb is not None:
+        try:
+            sb.table(_SB_TABLE).upsert({
+                "key": path.stem,
+                "value": data,
+                "updated_at": datetime.now().isoformat(),
+            }).execute()
+            return True
+        except Exception as e:
+            st.error(f"Error guardando '{path.stem}' en Supabase: {e}")
+            return False
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return True
@@ -523,9 +686,158 @@ class LiteVectorStore:
             "ids":       [[self._ids[i] for i in sel]],
         }
 
+    def delete_by_prefix(self, prefix: str):
+        """Borra todos los fragmentos cuyo id empieza con `prefix` (p.ej. al
+        re-indexar una norma oficial, para reemplazar sus fragmentos previos)."""
+        self.delete([i for i in self._ids if i.startswith(prefix)])
+
+
+class PineconeVectorStore:
+    """Adaptador de Pinecone con *embeddings integrados*: el propio índice genera
+    los vectores en el servidor (modelo configurado en el índice — p.ej.
+    llama-text-embed-v2), así que la app no necesita llamar a ninguna API de
+    embeddings ni guardar vectores localmente. Esto resuelve el problema de
+    persistencia en Render (filesystem efímero): el índice vive en la nube y
+    sobrevive a redeploys/reinicios.
+
+    Implementa el mismo subconjunto de la API de una Collection de Chroma que usa
+    el resto de esta app (count/get/upsert/delete/query) — más delete_by_prefix —
+    para no tener que tocar la lógica de indexado/búsqueda (rag_query, etc.)."""
+
+    _NS = "__default__"
+    _FIELDS = ["text", "source", "chunk_idx", "hash", "tipo_doc", "norma_key"]
+
+    def __init__(self, index_name: str, api_key: str):
+        self._index = None
+        try:
+            from pinecone import Pinecone
+            self._index = Pinecone(api_key=api_key).Index(index_name)
+        except Exception as e:
+            print(f"[Pinecone] no se pudo inicializar el índice '{index_name}': {e}")
+
+    @staticmethod
+    def _attr(obj, key, default=None):
+        """Acceso tolerante dict-u-objeto: el SDK de Pinecone devuelve distintos
+        tipos de modelo según el método (algunos son dicts, otros objetos
+        tipados como Hit/NamespaceSummary/ListItem) — evita duplicar lógica."""
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @classmethod
+    def _hits_of(cls, res):
+        result = cls._attr(res, "result")
+        return cls._attr(result, "hits") or []
+
+    @classmethod
+    def _hit_to_doc(cls, hit):
+        fields = dict(cls._attr(hit, "fields") or {})
+        _id = cls._attr(hit, "id") or cls._attr(hit, "_id") or ""
+        text = fields.pop("text", "")
+        return _id, text, fields
+
+    def count(self) -> int:
+        if self._index is None:
+            return 0
+        try:
+            stats = self._index.describe_index_stats()
+            namespaces = self._attr(stats, "namespaces") or {}
+            ns = namespaces.get(self._NS) if isinstance(namespaces, dict) else None
+            return int(self._attr(ns, "vector_count", 0) or 0)
+        except Exception as e:
+            print(f"[Pinecone] count: {e}")
+            return 0
+
+    def get(self, where: dict | None = None, include=None) -> dict:
+        """Recupera fragmentos por filtro de metadata (búsqueda con filtro y texto
+        neutro — Pinecone no ofrece un 'scan' directo por metadata). Pensado para
+        colecciones chicas (decenas de fragmentos por documento), no para escala masiva."""
+        ids, docs, metas = [], [], []
+        if self._index is None or not where:
+            return {"ids": ids, "documents": docs, "metadatas": metas}
+        # El modelo de embeddings integrado rechaza texto vacío/solo-espacios; usamos
+        # los propios valores del filtro como "texto neutro" (nunca vacío y, de paso,
+        # semánticamente relacionado, lo que ayuda a priorizar bien si hubiera >200 hits)
+        query_text = " ".join(str(v) for v in where.values() if v).strip() or "documento"
+        try:
+            res = self._index.search(namespace=self._NS, inputs={"text": query_text},
+                                      top_k=200, filter=where, fields=self._FIELDS)
+            for hit in self._hits_of(res):
+                _id, text, meta = self._hit_to_doc(hit)
+                ids.append(_id); docs.append(text); metas.append(meta)
+        except Exception as e:
+            print(f"[Pinecone] get: {e}")
+        return {"ids": ids, "documents": docs, "metadatas": metas}
+
+    def delete(self, ids: list):
+        if not ids or self._index is None:
+            return
+        try:
+            self._index.delete(ids=list(ids), namespace=self._NS)
+        except Exception as e:
+            print(f"[Pinecone] delete: {e}")
+
+    def delete_by_prefix(self, prefix: str):
+        if self._index is None:
+            return
+        try:
+            for batch in self._index.list(prefix=prefix, namespace=self._NS):
+                ids = [self._attr(v, "id") for v in (self._attr(batch, "vectors") or [])]
+                ids = [i for i in ids if i]
+                if ids:
+                    self._index.delete(ids=ids, namespace=self._NS)
+        except Exception as e:
+            print(f"[Pinecone] delete_by_prefix: {e}")
+
+    def upsert(self, documents: list, ids: list, metadatas: list):
+        if not documents or self._index is None:
+            return
+        records = []
+        for doc, _id, meta in zip(documents, ids, metadatas):
+            rec = {"_id": _id, "text": doc}
+            for k, v in (meta or {}).items():
+                if v is not None:
+                    rec[k] = v
+            records.append(rec)
+        BATCH = 90
+        for i in range(0, len(records), BATCH):
+            self._index.upsert_records(records=records[i:i + BATCH], namespace=self._NS)
+
+    def query(self, query_texts: list, n_results: int = 5, where: dict | None = None) -> dict:
+        empty = {"documents": [[]], "metadatas": [[]], "ids": [[]]}
+        if self._index is None or not query_texts:
+            return empty
+        try:
+            res = self._index.search(namespace=self._NS, inputs={"text": query_texts[0]},
+                                      top_k=max(1, n_results), filter=where, fields=self._FIELDS)
+            docs, metas, ids = [], [], []
+            for hit in self._hits_of(res):
+                _id, text, meta = self._hit_to_doc(hit)
+                ids.append(_id); docs.append(text); metas.append(meta)
+            return {"documents": [docs], "metadatas": [metas], "ids": [ids]}
+        except Exception as e:
+            print(f"[Pinecone] query: {e}")
+            return empty
+
 
 @st.cache_resource(show_spinner=False)
 def _init_vector_store():
+    """Elige el buscador semántico según las credenciales disponibles:
+    - Pinecone (embeddings integrados, índice en la nube — persiste en Render
+      pese al filesystem efímero) si están configuradas PINECONE_API_KEY/INDEX.
+    - Si no, el buscador propio liviano LiteVectorStore (numpy + JSON local),
+      pensado para uso local con DATA_DIR apuntando a Drive."""
+    pine_key = os.environ.get("PINECONE_API_KEY", "")
+    pine_idx = os.environ.get("PINECONE_INDEX", "")
+    if pine_key and pine_idx:
+        try:
+            store = PineconeVectorStore(pine_idx, pine_key)
+            if store._index is not None:
+                return store
+        except Exception as e:
+            print(f"[Pinecone] no disponible, uso buscador local: {e}")
     ef = GeminiEmbeddingFunction(os.environ.get("GEMINI_API_KEY", ""))
     return LiteVectorStore(VECTOR_STORE_PATH, ef)
 
@@ -1511,7 +1823,7 @@ PREGUNTA: {question}"""
     return "Error generando respuesta."
 
 
-# ─── CHROMADB INDEXING ────────────────────────────────────────────────────────
+# ─── INDEXADO EN EL BUSCADOR SEMÁNTICO (Pinecone en la nube / LiteVectorStore local) ──
 def index_document(file_bytes: bytes, filename: str, text: str) -> None:
     fhash = hashlib.md5(file_bytes).hexdigest()[:8]
     chunks = chunk_text(text)
@@ -1520,7 +1832,7 @@ def index_document(file_bytes: bytes, filename: str, text: str) -> None:
     ids  = [f"{fhash}_{i}" for i in range(len(chunks))]
     meta = [{"source":filename,"chunk_idx":i,"hash":fhash} for i in range(len(chunks))]
     try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
-    except Exception as e: st.warning(f"ChromaDB: {e}")
+    except Exception as e: st.warning(f"Buscador semántico: {e}")
 
 
 def reindex_documentos(lista_maestra: list, analisis_cache: dict) -> int:
@@ -1548,10 +1860,11 @@ def reindex_documentos(lista_maestra: list, analisis_cache: dict) -> int:
             st.warning(f"Error reindexando {nombre}: {e}")
     # Re-indexar también las normas oficiales (documento madre), si las hay
     for norma_key, info in cargar_normas_registry().items():
-        p = Path(info.get("archivo_path", ""))
-        if p.exists():
+        ref = info.get("archivo_path", "")
+        data = _file_read(ref)
+        if data:
             try:
-                _guardar_norma_iso(norma_key, p.read_bytes(), p.name)
+                _guardar_norma_iso(norma_key, data, info.get("nombre_archivo") or _file_name(ref))
             except Exception as e:
                 st.warning(f"Error reindexando norma {norma_key}: {e}")
     return n
@@ -1568,24 +1881,22 @@ def cargar_normas_registry() -> dict:
 
 def _guardar_norma_iso(norma_key: str, file_bytes: bytes, filename: str) -> dict | None:
     """Guarda el texto oficial de la norma como documento madre: lo almacena físicamente
-    en Drive, extrae su texto completo y lo indexa en ChromaDB con metadata especial
+    (Supabase Storage en la nube / Drive en uso local — ver _file_save), extrae su texto
+    completo y lo indexa en el buscador semántico con metadata especial
     (tipo_doc='norma_oficial') para que el chatbot la use como referencia normativa
     primaria al consultar y comparar los documentos del SGI contra la norma."""
     info = NORMAS_INFO.get(norma_key)
     if not info:
         return None
-    ext  = Path(filename).suffix.lower() or ".pdf"
-    dest = NORMAS_PATH / f"{norma_key}{ext}"
-    dest.write_bytes(file_bytes)
+    ext = Path(filename).suffix.lower() or ".pdf"
+    ref = _file_save("normas", f"{norma_key}{ext}", file_bytes)
 
     texto = extract_text(file_bytes, filename) or ""
     if texto.strip():
         col = get_collection()
         # Reemplazar fragmentos previos de esta norma antes de re-indexar
         try:
-            prev = col.get(where={"norma_key": norma_key})
-            if prev.get("ids"):
-                col.delete(ids=prev["ids"])
+            col.delete_by_prefix(f"norma_{norma_key}_")
         except Exception:
             pass
         chunks = chunk_text(texto)
@@ -1594,13 +1905,13 @@ def _guardar_norma_iso(norma_key: str, file_bytes: bytes, filename: str) -> dict
             meta = [{"source": info["tag"], "chunk_idx": i,
                      "tipo_doc": "norma_oficial", "norma_key": norma_key} for i in range(len(chunks))]
             try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
-            except Exception as e: st.warning(f"ChromaDB: {e}")
+            except Exception as e: st.warning(f"Buscador semántico: {e}")
 
     registry = cargar_normas_registry()
     registry[norma_key] = {
         "label": info["label"],
         "nombre_archivo": filename,
-        "archivo_path": str(dest),
+        "archivo_path": ref,
         "fecha_carga": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "caracteres": len(texto),
     }
@@ -3385,10 +3696,12 @@ def render_sidebar(lista_maestra: list, incongruencias: dict, analisis_cache: di
             for t,cnt in sorted(tipos.items(),key=lambda x:-x[1]):
                 st.markdown(f"&nbsp;&nbsp;{tipo_badge(t)}&nbsp; ×{cnt}", unsafe_allow_html=True)
         st.markdown("---")
-        st.markdown('<div class="foot-info">🤖 Gemini 2.5 Flash<br>🔍 ChromaDB local<br>'
-                    '📐 all-MiniLM-L6-v2<br>📄 python-docx<br><br>'
-                    '📁 lista_maestra.json<br>📁 incongruencias.json<br>'
-                    '📁 revisiones.json<br>📁 ./chroma_db/</div>',
+        _usa_sb = _supabase_client() is not None
+        _usa_pc = isinstance(get_collection(), PineconeVectorStore)
+        _buscador = "🔍 Pinecone (embeddings integrados)" if _usa_pc else "🔍 Buscador propio (numpy)"
+        _persist  = "☁️ Supabase (datos + archivos)" if _usa_sb else "📁 Archivos locales (Drive)"
+        st.markdown(f'<div class="foot-info">🤖 Gemini 2.5 Flash<br>{_buscador}<br>'
+                    f'{_persist}<br>📄 python-docx</div>',
                     unsafe_allow_html=True)
 
 
@@ -3427,7 +3740,7 @@ def tab_documentos(lista_maestra: list, analisis_cache: dict, incongruencias: di
         prog.progress(35); classification = classify_document(text, uploaded.name)
         st.write("🔍 Analizando incongruencias y sugerencias (una sola vez)...")
         prog.progress(58); deep = analyze_document_deep(text, uploaded.name)
-        st.write("🧠 Vectorizando e indexando en ChromaDB...")
+        st.write("🧠 Vectorizando e indexando en el buscador semántico...")
         prog.progress(78); index_document(file_bytes, uploaded.name, text)
         st.write("💾 Guardando en Lista Maestra y tracker de incongruencias...")
         prog.progress(92)
@@ -3475,7 +3788,7 @@ def tab_revisiones(lista_maestra: list, analisis_cache: dict):
     if "revisión" in modo or "revision" in modo.lower():
         st.markdown('<div class="card-info" style="color:#1e293b!important">'
                     'Suba la <b>nueva versión</b> del documento. El sistema recuperará el texto original '
-                    'desde ChromaDB y realizará una comparación <b>cláusula por cláusula</b> contra ISO 9001:2015 '
+                    'del buscador semántico y realizará una comparación <b>cláusula por cláusula</b> contra ISO 9001:2015 '
                     'e ISO 39001:2015 para emitir un veredicto normativo.</div>', unsafe_allow_html=True)
         if not activos:
             st.warning("No hay documentos activos. Suba documentos en la pestaña 📂 Documentos.")
@@ -3784,7 +4097,7 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                             st.rerun()
                     with rc3:
                         archivo_path = doc.get("archivo_path","")
-                        if archivo_path and Path(archivo_path).exists():
+                        if archivo_path and _file_exists(archivo_path):
                             if st.button("📄 Ver PDF", key=f"pdf_{doc['hash']}", use_container_width=True):
                                 current = st.session_state.get("repo_pdf_doc")
                                 st.session_state["repo_pdf_doc"] = None if current == doc["nombre"] else doc["nombre"]
@@ -3828,7 +4141,7 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                             arch = _guardar_archivo_doc(vin_file.getvalue(), vin_file.name)
                             for i, d in enumerate(lista_maestra):
                                 if d.get("hash") == doc["hash"]:
-                                    lista_maestra[i]["archivo_path"] = str(arch)
+                                    lista_maestra[i]["archivo_path"] = arch or ""
                                     break
                             save_json(LISTA_MAESTRA_PATH, lista_maestra)
                             st.session_state.pop(f"vincular_{doc['hash']}", None)
@@ -4184,11 +4497,14 @@ def render_right_panel(lista_maestra: list, analisis_cache: dict):
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
 
-    # ── Auto-refresh: detecta cambios en Drive desde otro dispositivo ────────────
-    mtime_actual = LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
+    # ── Auto-refresh: detecta cambios desde otro dispositivo/sesión ──────────────
+    # En uso local (Drive) se compara el mtime del archivo; en Supabase (Render) se
+    # compara la marca "updated_at" de la fila — ambos son sólo "versiones" opacas
+    # que se comparan por igualdad, no se interpretan como fechas.
+    mtime_actual = _lista_maestra_version()
     mtime_previo = st.session_state.get("_data_mtime", 0)
     if mtime_actual != mtime_previo:
-        if mtime_previo != 0:   # no es la primera carga → otro dispositivo modificó
+        if mtime_previo not in (0, ""):   # no es la primera carga → otra sesión modificó
             st.toast("📡 Datos actualizados desde otro dispositivo", icon="🔄")
         st.session_state["_data_mtime"] = mtime_actual
 
@@ -4197,16 +4513,16 @@ def main():
     _now = _time.time()
     if _now - st.session_state.get("_last_autocheck", 0) > 30:
         st.session_state["_last_autocheck"] = _now
-        new_mtime = LISTA_MAESTRA_PATH.stat().st_mtime if LISTA_MAESTRA_PATH.exists() else 0
+        new_mtime = _lista_maestra_version()
         if new_mtime != st.session_state.get("_data_mtime", 0):
             st.session_state["_data_mtime"] = new_mtime
             st.rerun()
 
     # ── Precarga del buscador semántico (primera vez muestra spinner y recarga) ──
-    if "chroma_ready" not in st.session_state:
+    if "vector_store_ready" not in st.session_state:
         with st.spinner("⚙️ Iniciando buscador semántico..."):
             _init_vector_store()
-        st.session_state["chroma_ready"] = True
+        st.session_state["vector_store_ready"] = True
         st.rerun()   # re-renderiza la UI completa con el índice ya en caché
 
     # Session state
