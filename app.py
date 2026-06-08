@@ -1313,10 +1313,26 @@ def rag_query(question: str) -> str:
     if total == 0:
         return "No hay documentos indexados. Suba archivos primero."
     try:
-        results = col.query(query_texts=[question], n_results=min(RAG_TOP_K, total))
-        docs, metas = results["documents"][0], results["metadatas"][0]
+        # Pedimos más resultados de los necesarios y luego descartamos los fragmentos de
+        # las normas oficiales: como conviven en la misma colección, una pregunta cuyo
+        # fraseo se parece al texto de la norma (p.ej. "alcance del sistema de gestión",
+        # que ISO define literalmente en su cláusula 3.16) hace que esos chunks "ganen"
+        # por similitud semántica y desplacen a los documentos propios del SGI (Manual de
+        # Gestión, etc.) fuera del top-K — dejando al modelo sin el contenido de la
+        # organización y respondiendo solo con la definición genérica de la norma.
+        results = col.query(query_texts=[question], n_results=min(RAG_TOP_K + 6, total))
+        raw_docs, raw_metas = results["documents"][0], results["metadatas"][0]
     except Exception as e:
         return f"Error en búsqueda vectorial: {e}"
+
+    docs, metas = [], []
+    for d, m in zip(raw_docs, raw_metas):
+        if m.get("tipo_doc") == "norma_oficial":
+            continue
+        docs.append(d)
+        metas.append(m)
+        if len(docs) >= RAG_TOP_K:
+            break
 
     # Buscar también en el texto oficial de las normas (documento madre), si están cargadas
     norma_docs, norma_metas = [], []
@@ -1341,17 +1357,31 @@ def rag_query(question: str) -> str:
         return "**Fragmentos encontrados (configure GEMINI_API_KEY para respuesta interpretada):**\n\n" + full
 
     norma_block = (
-        f"\n\nTEXTO OFICIAL DE LA NORMA (documento madre — fuente primaria y autoritativa: "
-        f"usalo para verificar, contrastar y comparar el contenido de los documentos del SGI "
-        f"contra el requisito normativo exacto, citando la cláusula correspondiente):\n{norma_context}"
+        f"\n\nTEXTO OFICIAL DE LA NORMA (documento madre — referencia normativa oficial, "
+        f"NO describe a la organización: úsalo solo para citar el requisito/definición exacta "
+        f"de la cláusula correspondiente cuando haga falta comparar, verificar cumplimiento o "
+        f"contrastar contra la norma):\n{norma_context}"
         if norma_context else ""
     )
     prompt = f"""Eres Asistente de Auditoría SGI experto en ISO 9001:2015 e ISO 39001:2015.
-Responde basándote EXCLUSIVAMENTE en estos fragmentos. Si la info no está, indícalo.
-Cuando el usuario pida comparar, verificar cumplimiento o contrastar contra la norma, priorizá
-el TEXTO OFICIAL DE LA NORMA (si está disponible) como base normativa exacta.
+Responde basándote EXCLUSIVAMENTE en los fragmentos provistos. Si la info no está, indícalo
+explícitamente — no inventes ni completes con conocimiento general de la norma.
 
-FRAGMENTOS DE DOCUMENTOS DEL SGI:
+REGLA DE PRIORIDAD DE FUENTES (muy importante, no la ignores):
+- Si la pregunta es sobre LA ORGANIZACIÓN (su alcance, su política, sus procesos, sus
+  procedimientos, sus responsables, "cuál es nuestro/el alcance del sistema de gestión",
+  "qué dice nuestro manual", etc.), la respuesta DEBE basarse principalmente en los
+  "FRAGMENTOS DE DOCUMENTOS DEL SGI" (son los documentos propios de la organización: Manual
+  de Gestión, procedimientos, políticas, etc.). NO respondas con la definición genérica de
+  la norma cuando lo que se pide es el dato concreto y propio de la organización.
+- El "TEXTO OFICIAL DE LA NORMA" es solo una referencia normativa de apoyo: úsalo para citar
+  el requisito/definición exacta de una cláusula, o cuando el usuario pida explícitamente
+  comparar, verificar cumplimiento o contrastar el documento del SGI contra la norma.
+- Si encontrás el dato en los documentos del SGI, citalo primero y, si corresponde, agregá
+  después la cláusula de la norma como contraste — nunca al revés.
+
+FRAGMENTOS DE DOCUMENTOS DEL SGI (documentos propios de la organización — fuente principal
+para preguntas sobre la organización):
 {context}
 {norma_block}
 
