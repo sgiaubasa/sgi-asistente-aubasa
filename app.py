@@ -1889,23 +1889,30 @@ def _guardar_norma_iso(norma_key: str, file_bytes: bytes, filename: str) -> dict
     if not info:
         return None
     ext = Path(filename).suffix.lower() or ".pdf"
+
+    # Extraemos el texto PRIMERO: si no se puede leer nada (p. ej. PDF escaneado
+    # sin OCR disponible), no tiene sentido guardar el archivo ni "registrar"
+    # la norma como cargada — eso dejaría el panel en un estado inconsistente
+    # ("cargada" pero con 0 caracteres, inutilizable por el chatbot).
+    texto = extract_text(file_bytes, filename) or ""
+    if not texto.strip():
+        return {"caracteres": 0}
+
     ref = _file_save("normas", f"{norma_key}{ext}", file_bytes)
 
-    texto = extract_text(file_bytes, filename) or ""
-    if texto.strip():
-        col = get_collection()
-        # Reemplazar fragmentos previos de esta norma antes de re-indexar
-        try:
-            col.delete_by_prefix(f"norma_{norma_key}_")
-        except Exception:
-            pass
-        chunks = chunk_text(texto)
-        if chunks:
-            ids  = [f"norma_{norma_key}_{i}" for i in range(len(chunks))]
-            meta = [{"source": info["tag"], "chunk_idx": i,
-                     "tipo_doc": "norma_oficial", "norma_key": norma_key} for i in range(len(chunks))]
-            try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
-            except Exception as e: st.warning(f"Buscador semántico: {e}")
+    col = get_collection()
+    # Reemplazar fragmentos previos de esta norma antes de re-indexar
+    try:
+        col.delete_by_prefix(f"norma_{norma_key}_")
+    except Exception:
+        pass
+    chunks = chunk_text(texto)
+    if chunks:
+        ids  = [f"norma_{norma_key}_{i}" for i in range(len(chunks))]
+        meta = [{"source": info["tag"], "chunk_idx": i,
+                 "tipo_doc": "norma_oficial", "norma_key": norma_key} for i in range(len(chunks))]
+        try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
+        except Exception as e: st.warning(f"Buscador semántico: {e}")
 
     registry = cargar_normas_registry()
     registry[norma_key] = {
@@ -4400,14 +4407,22 @@ def tab_chatbot(lista_maestra: list):
                     type=["pdf", "docx", "txt"], key=f"norma_up_{norma_key}",
                 )
                 if norma_file:
-                    with st.spinner(f"Procesando e indexando {info['label']} como documento madre..."):
-                        res = _guardar_norma_iso(norma_key, norma_file.getvalue(), norma_file.name)
-                    if res and res.get("caracteres", 0) > 0:
-                        st.success(f"✅ {info['label']} indexada correctamente "
-                                   f"({res['caracteres']:,} caracteres).".replace(",", "."))
-                        st.rerun()
-                    else:
-                        st.error("⚠️ No se pudo extraer texto del archivo. Probá con otro formato (PDF con texto seleccionable o DOCX).")
+                    # st.file_uploader conserva el archivo en su estado entre
+                    # reruns (incluido el que dispara st.rerun() tras un éxito),
+                    # así que sin esta guarda el mismo archivo se reprocesaría
+                    # una y otra vez en bucle. Solo procesamos si es nuevo.
+                    huella = f"{norma_file.name}:{norma_file.size}"
+                    flag_key = f"_norma_procesada_{norma_key}"
+                    if st.session_state.get(flag_key) != huella:
+                        with st.spinner(f"Procesando e indexando {info['label']} como documento madre..."):
+                            res = _guardar_norma_iso(norma_key, norma_file.getvalue(), norma_file.name)
+                        st.session_state[flag_key] = huella
+                        if res and res.get("caracteres", 0) > 0:
+                            st.success(f"✅ {info['label']} indexada correctamente "
+                                       f"({res['caracteres']:,} caracteres).".replace(",", "."))
+                            st.rerun()
+                        else:
+                            st.error("⚠️ No se pudo extraer texto del archivo. Probá con otro formato (PDF con texto seleccionable o DOCX).")
 
     if not lista_maestra:
         st.markdown('<div class="card-info" style="color:#1e293b!important">👆 Suba documentos del SGI '
