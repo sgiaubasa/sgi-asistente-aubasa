@@ -1,13 +1,14 @@
 """
 Asistente de Auditoría SGI — v3.0
 ISO 9001:2015 / ISO 39001:2015
-Stack: Streamlit · ChromaDB · Gemini 2.5 Flash · all-MiniLM-L6-v2 · python-docx
+Stack: Streamlit · buscador semántico propio (numpy) · Gemini · python-docx
 """
 
-import os, json, hashlib, tempfile, uuid
+import os, json, hashlib, tempfile, uuid, threading
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
+import numpy as np
 
 # ─── CARGAR .env AUTOMÁTICAMENTE ─────────────────────────────────────────────
 def _load_dotenv():
@@ -57,10 +58,13 @@ HALLAZGOS_PATH       = _DATA_DIR / "hallazgos_auditoria.json"
 INDICADORES_PATH     = _DATA_DIR / "indicadores_sgi.json"
 RIESGOS_PATH         = _DATA_DIR / "riesgos_sectores.json"
 CHECKLIST_PATH       = _DATA_DIR / "checklist_cargas.json"
-CHROMA_PATH          = str(_DATA_DIR / "chroma_db")  # compartido junto a los datos
-# v2: nueva colección porque cambia la dimensionalidad del vector al pasar de
+# Buscador semántico propio y liviano (reemplaza a ChromaDB — ver LiteVectorStore):
+# ChromaDB arrastra ~125 MB de dependencias pesadas (onnxruntime, kubernetes, pyarrow,
+# grpc, fastapi...) que no se necesitan para una colección local de pocas decenas de
+# fragmentos, y eso agotaba la RAM/tiempo de build del hosting (Render free tier: 512 MB).
+# v2: nuevo archivo porque cambia la dimensionalidad del vector al pasar de
 # sentence-transformers (384) a la API de embeddings de Gemini (768)
-CHROMA_COLLECTION    = "sgi_documentos_v2"
+VECTOR_STORE_PATH    = _DATA_DIR / "vector_store_v2.json"
 
 # Carpetas de archivos físicos en Drive
 DOCS_ACTIVOS_PATH   = _DATA_DIR / "documentos" / "activos"
@@ -401,18 +405,132 @@ class GeminiEmbeddingFunction:
         return {"api_key": self._api_key}
 
 
+class LiteVectorStore:
+    """Buscador semántico propio y liviano — reemplaza a ChromaDB.
+
+    Guarda ids/documentos/metadatas/embeddings en un único JSON junto a los demás
+    datos (mismo patrón que el resto de la app: load_json/save_json sobre _DATA_DIR)
+    y busca por similitud coseno con numpy (fuerza bruta). Para esta escala — decenas
+    de fragmentos, no millones — es instantáneo, y evita sumar ~125 MB de dependencias
+    pesadas (onnxruntime, kubernetes, pyarrow, grpc, fastapi, opentelemetry...) que
+    ChromaDB arrastra siempre, sin importar el motor de embeddings que se use.
+
+    Implementa el mismo subconjunto de la API de una Collection de Chroma que usa esta
+    app (count/get/upsert/delete/query) para no tener que tocar el resto del código."""
+
+    def __init__(self, path: Path, embedding_fn):
+        self._path = path
+        self._ef   = embedding_fn
+        self._lock = threading.Lock()
+        self._ids: list[str] = []
+        self._documents: list[str] = []
+        self._metadatas: list[dict] = []
+        self._embeddings = np.zeros((0, 0), dtype=np.float32)
+        self._load()
+
+    # ── Persistencia ──────────────────────────────────────────────────────────
+    def _load(self):
+        data = load_json(self._path, {})
+        self._ids       = list(data.get("ids", []))
+        self._documents = list(data.get("documents", []))
+        self._metadatas = list(data.get("metadatas", []))
+        embs = data.get("embeddings", [])
+        self._embeddings = np.array(embs, dtype=np.float32) if embs else np.zeros((0, 0), dtype=np.float32)
+
+    def _save(self):
+        save_json(self._path, {
+            "ids": self._ids,
+            "documents": self._documents,
+            "metadatas": self._metadatas,
+            "embeddings": self._embeddings.tolist(),
+        })
+
+    @staticmethod
+    def _matches(meta: dict, where: dict | None) -> bool:
+        if not where:
+            return True
+        return all(meta.get(k) == v for k, v in where.items())
+
+    # ── API estilo ChromaDB Collection ───────────────────────────────────────
+    def count(self) -> int:
+        return len(self._ids)
+
+    def get(self, where: dict | None = None, include=None) -> dict:
+        ids, docs, metas = [], [], []
+        for i, m in enumerate(self._metadatas):
+            if self._matches(m, where):
+                ids.append(self._ids[i])
+                docs.append(self._documents[i])
+                metas.append(m)
+        return {"ids": ids, "documents": docs, "metadatas": metas}
+
+    def delete(self, ids: list):
+        if not ids:
+            return
+        drop = set(ids)
+        keep = [i for i, _id in enumerate(self._ids) if _id not in drop]
+        with self._lock:
+            self._ids       = [self._ids[i] for i in keep]
+            self._documents = [self._documents[i] for i in keep]
+            self._metadatas = [self._metadatas[i] for i in keep]
+            dim = self._embeddings.shape[1] if self._embeddings.ndim == 2 and self._embeddings.size else 0
+            self._embeddings = self._embeddings[keep] if keep else np.zeros((0, dim), dtype=np.float32)
+            self._save()
+
+    def upsert(self, documents: list, ids: list, metadatas: list):
+        if not documents:
+            return
+        new_embs = np.asarray(self._ef(documents), dtype=np.float32)
+        with self._lock:
+            idx_by_id = {_id: pos for pos, _id in enumerate(self._ids)}
+            for doc, _id, meta, emb in zip(documents, ids, metadatas, new_embs):
+                if _id in idx_by_id:
+                    pos = idx_by_id[_id]
+                    self._documents[pos] = doc
+                    self._metadatas[pos] = meta
+                    self._embeddings[pos] = emb
+                else:
+                    self._ids.append(_id)
+                    self._documents.append(doc)
+                    self._metadatas.append(meta)
+                    if self._embeddings.size == 0:
+                        self._embeddings = emb.reshape(1, -1).astype(np.float32)
+                    else:
+                        self._embeddings = np.vstack([self._embeddings, emb.reshape(1, -1)])
+                    idx_by_id[_id] = len(self._ids) - 1
+            self._save()
+
+    def query(self, query_texts: list, n_results: int = 5, where: dict | None = None) -> dict:
+        empty = {"documents": [[]], "metadatas": [[]], "ids": [[]]}
+        if not self._ids or not query_texts:
+            return empty
+        candidates = [i for i, m in enumerate(self._metadatas) if self._matches(m, where)]
+        if not candidates:
+            return empty
+        try:
+            q = np.asarray(self._ef.embed_query(list(query_texts)), dtype=np.float32)[0]
+        except Exception:
+            return empty
+        embs = self._embeddings[candidates]
+        qn = q / (np.linalg.norm(q) + 1e-12)
+        en = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12)
+        sims  = en @ qn
+        order = np.argsort(-sims)[:max(1, n_results)]
+        sel   = [candidates[i] for i in order]
+        return {
+            "documents": [[self._documents[i] for i in sel]],
+            "metadatas": [[self._metadatas[i] for i in sel]],
+            "ids":       [[self._ids[i] for i in sel]],
+        }
+
+
 @st.cache_resource(show_spinner=False)
-def _init_chroma():
-    import chromadb
+def _init_vector_store():
     ef = GeminiEmbeddingFunction(os.environ.get("GEMINI_API_KEY", ""))
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_or_create_collection(
-        name=CHROMA_COLLECTION, embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+    return LiteVectorStore(VECTOR_STORE_PATH, ef)
 
 def get_collection():
-    return _init_chroma()
+    return _init_vector_store()
 
 def get_document_text_from_chroma(filename: str) -> str:
     try:
@@ -4084,12 +4202,12 @@ def main():
             st.session_state["_data_mtime"] = new_mtime
             st.rerun()
 
-    # ── Precarga del motor de embeddings (primera vez muestra spinner y recarga) ──
+    # ── Precarga del buscador semántico (primera vez muestra spinner y recarga) ──
     if "chroma_ready" not in st.session_state:
-        with st.spinner("⚙️ Iniciando motor de búsqueda semántica (~90 MB, solo la primera vez)..."):
-            _init_chroma()
+        with st.spinner("⚙️ Iniciando buscador semántico..."):
+            _init_vector_store()
         st.session_state["chroma_ready"] = True
-        st.rerun()   # re-renderiza la UI completa con el modelo ya en caché
+        st.rerun()   # re-renderiza la UI completa con el índice ya en caché
 
     # Session state
     for k, v in [("messages",[]),("create_messages",[]),("generated_doc",None),
