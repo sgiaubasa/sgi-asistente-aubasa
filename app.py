@@ -66,6 +66,11 @@ DOCS_OBSOLETOS_PATH = _DATA_DIR / "documentos" / "obsoletos"
 DOCS_ACTIVOS_PATH.mkdir(parents=True, exist_ok=True)
 DOCS_OBSOLETOS_PATH.mkdir(parents=True, exist_ok=True)
 
+# Normas oficiales (documento madre) — referencia primaria para el chatbot
+NORMAS_PATH = _DATA_DIR / "documentos" / "normas"
+NORMAS_PATH.mkdir(parents=True, exist_ok=True)
+NORMAS_REGISTRY_PATH = _DATA_DIR / "normas_iso.json"
+
 CHUNK_SIZE       = 700
 CHUNK_OVERLAP    = 80
 RAG_TOP_K        = 3
@@ -1254,20 +1259,48 @@ def rag_query(question: str) -> str:
         docs, metas = results["documents"][0], results["metadatas"][0]
     except Exception as e:
         return f"Error en búsqueda vectorial: {e}"
-    if not docs: return "No se encontraron fragmentos relevantes."
+
+    # Buscar también en el texto oficial de las normas (documento madre), si están cargadas
+    norma_docs, norma_metas = [], []
+    if cargar_normas_registry():
+        try:
+            nres = col.query(query_texts=[question], n_results=2,
+                             where={"tipo_doc": "norma_oficial"})
+            norma_docs  = nres["documents"][0]
+            norma_metas = nres["metadatas"][0]
+        except Exception:
+            pass
+
+    if not docs and not norma_docs:
+        return "No se encontraron fragmentos relevantes."
+
     context = "\n\n---\n\n".join(f"[{m.get('source','?')}]\n{d}" for d, m in zip(docs, metas))
+    norma_context = "\n\n---\n\n".join(f"[{m.get('source','?')}]\n{d}" for d, m in zip(norma_docs, norma_metas))
+    all_metas = list(metas) + list(norma_metas)
+
     if not os.environ.get("GEMINI_API_KEY"):
-        return "**Fragmentos encontrados (configure GEMINI_API_KEY para respuesta interpretada):**\n\n" + context
+        full = context + (f"\n\n=== TEXTO OFICIAL DE LA NORMA ===\n{norma_context}" if norma_context else "")
+        return "**Fragmentos encontrados (configure GEMINI_API_KEY para respuesta interpretada):**\n\n" + full
+
+    norma_block = (
+        f"\n\nTEXTO OFICIAL DE LA NORMA (documento madre — fuente primaria y autoritativa: "
+        f"usalo para verificar, contrastar y comparar el contenido de los documentos del SGI "
+        f"contra el requisito normativo exacto, citando la cláusula correspondiente):\n{norma_context}"
+        if norma_context else ""
+    )
     prompt = f"""Eres Asistente de Auditoría SGI experto en ISO 9001:2015 e ISO 39001:2015.
 Responde basándote EXCLUSIVAMENTE en estos fragmentos. Si la info no está, indícalo.
+Cuando el usuario pida comparar, verificar cumplimiento o contrastar contra la norma, priorizá
+el TEXTO OFICIAL DE LA NORMA (si está disponible) como base normativa exacta.
 
-FRAGMENTOS:
+FRAGMENTOS DE DOCUMENTOS DEL SGI:
 {context}
+{norma_block}
 
 PREGUNTA: {question}"""
     answer = _call_gemini(prompt)
     if answer:
-        sources = ", ".join({m.get("source","?") for m in metas})
+        sources = ", ".join(dict.fromkeys(m.get("source","?") for m in all_metas))
         return f"{answer}\n\n*📁 Fuentes: {sources}*"
     return "Error generando respuesta."
 
@@ -1282,6 +1315,57 @@ def index_document(file_bytes: bytes, filename: str, text: str) -> None:
     meta = [{"source":filename,"chunk_idx":i,"hash":fhash} for i in range(len(chunks))]
     try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
     except Exception as e: st.warning(f"ChromaDB: {e}")
+
+
+# ─── NORMAS OFICIALES (DOCUMENTO MADRE) ───────────────────────────────────────
+NORMAS_INFO = {
+    "iso9001":  {"label": "ISO 9001:2015",  "tag": "📘 Norma ISO 9001:2015 (documento madre — oficial)"},
+    "iso39001": {"label": "ISO 39001:2015", "tag": "📗 Norma ISO 39001:2015 (documento madre — oficial)"},
+}
+
+def cargar_normas_registry() -> dict:
+    return load_json(NORMAS_REGISTRY_PATH, {})
+
+def _guardar_norma_iso(norma_key: str, file_bytes: bytes, filename: str) -> dict | None:
+    """Guarda el texto oficial de la norma como documento madre: lo almacena físicamente
+    en Drive, extrae su texto completo y lo indexa en ChromaDB con metadata especial
+    (tipo_doc='norma_oficial') para que el chatbot la use como referencia normativa
+    primaria al consultar y comparar los documentos del SGI contra la norma."""
+    info = NORMAS_INFO.get(norma_key)
+    if not info:
+        return None
+    ext  = Path(filename).suffix.lower() or ".pdf"
+    dest = NORMAS_PATH / f"{norma_key}{ext}"
+    dest.write_bytes(file_bytes)
+
+    texto = extract_text(file_bytes, filename) or ""
+    if texto.strip():
+        col = get_collection()
+        # Reemplazar fragmentos previos de esta norma antes de re-indexar
+        try:
+            prev = col.get(where={"norma_key": norma_key})
+            if prev.get("ids"):
+                col.delete(ids=prev["ids"])
+        except Exception:
+            pass
+        chunks = chunk_text(texto)
+        if chunks:
+            ids  = [f"norma_{norma_key}_{i}" for i in range(len(chunks))]
+            meta = [{"source": info["tag"], "chunk_idx": i,
+                     "tipo_doc": "norma_oficial", "norma_key": norma_key} for i in range(len(chunks))]
+            try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
+            except Exception as e: st.warning(f"ChromaDB: {e}")
+
+    registry = cargar_normas_registry()
+    registry[norma_key] = {
+        "label": info["label"],
+        "nombre_archivo": filename,
+        "archivo_path": str(dest),
+        "fecha_carga": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "caracteres": len(texto),
+    }
+    save_json(NORMAS_REGISTRY_PATH, registry)
+    return registry[norma_key]
 
 
 # ─── GESTIÓN DE INCONGRUENCIAS ────────────────────────────────────────────────
@@ -3451,10 +3535,13 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                                 current = st.session_state.get("repo_pdf_doc")
                                 st.session_state["repo_pdf_doc"] = None if current == doc["nombre"] else doc["nombre"]
                                 st.session_state.pop("repo_view_doc", None)
+                                st.session_state.pop(f"vincular_{doc['hash']}", None)
                                 st.rerun()
                         else:
-                            st.markdown('<span style="font-size:.72rem;color:#9ca3af">📄 Sin archivo</span>',
-                                        unsafe_allow_html=True)
+                            if st.button("📎 Vincular archivo", key=f"vbtn_{doc['hash']}", use_container_width=True):
+                                cur = st.session_state.get(f"vincular_{doc['hash']}", False)
+                                st.session_state[f"vincular_{doc['hash']}"] = not cur
+                                st.rerun()
                     with rc4:
                         if st.button("📦 Archivar como Obsoleto", key=f"arch_{doc['hash']}", use_container_width=True):
                             for i,d in enumerate(lista_maestra):
@@ -3469,6 +3556,32 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                             save_json(LISTA_MAESTRA_PATH, lista_maestra)
                             st.success(f"**{doc['nombre']}** archivado como obsoleto.")
                             st.rerun()
+                    # Vincular archivo físico (para docs cargados antes de esta función)
+                    if st.session_state.get(f"vincular_{doc['hash']}", False):
+                        st.markdown(
+                            '<div style="background:#eff6ff;border:1px dashed #3b82f6;border-radius:8px;'
+                            'padding:12px 16px;margin:6px 0">'
+                            '<div style="font-size:.82rem;color:#1d4ed8;font-weight:600;margin-bottom:6px">'
+                            '📎 Subí el archivo para vincularlo (sin re-analizar)</div>',
+                            unsafe_allow_html=True)
+                        vin_file = st.file_uploader(
+                            "Seleccioná el archivo",
+                            type=["pdf","docx","xlsx","txt"],
+                            key=f"vin_up_{doc['hash']}",
+                            label_visibility="collapsed"
+                        )
+                        if vin_file:
+                            arch = _guardar_archivo_doc(vin_file.getvalue(), vin_file.name)
+                            for i, d in enumerate(lista_maestra):
+                                if d.get("hash") == doc["hash"]:
+                                    lista_maestra[i]["archivo_path"] = str(arch)
+                                    break
+                            save_json(LISTA_MAESTRA_PATH, lista_maestra)
+                            st.session_state.pop(f"vincular_{doc['hash']}", None)
+                            st.success(f"✅ Archivo vinculado correctamente.")
+                            st.rerun()
+                        st.markdown('</div>', unsafe_allow_html=True)
+
                     # Visor PDF
                     if st.session_state.get("repo_pdf_doc") == doc["nombre"]:
                         st.markdown(f'<div style="font-size:.78rem;font-weight:700;color:#1565c0;'
@@ -3680,6 +3793,55 @@ qué cláusulas ISO aplican y qué secciones principales tendrá. Luego indicale
 # ─── TAB: CHATBOT ─────────────────────────────────────────────────────────────
 def tab_chatbot(lista_maestra: list):
     st.markdown('<p class="sec-title">💬 Chatbot de Consulta SGI</p>', unsafe_allow_html=True)
+
+    # ── Normas oficiales de referencia (documento madre) ──
+    registry = cargar_normas_registry()
+    n_cargadas = len(registry)
+    with st.expander(f"📚 Normas oficiales de referencia — documento madre  ({n_cargadas}/2 cargada(s))",
+                     expanded=(n_cargadas < 2)):
+        st.markdown(
+            '<div class="card-info" style="color:#1e293b!important">'
+            '📌 Subí el texto oficial de <b>ISO 9001:2015</b> e <b>ISO 39001:2015</b> (PDF, DOCX o TXT). '
+            'El asistente las indexa como <b>documento madre</b> y las usa como referencia normativa '
+            'primaria para responder consultas y <b>comparar</b> los documentos del SGI contra el '
+            'requisito exacto de la norma, citando la cláusula correspondiente.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        nc1, nc2 = st.columns(2)
+        for col_ui, norma_key in ((nc1, "iso9001"), (nc2, "iso39001")):
+            info = NORMAS_INFO[norma_key]
+            with col_ui:
+                actual = registry.get(norma_key)
+                if actual:
+                    st.markdown(
+                        f'<div class="card-ok" style="color:#1e293b!important;font-size:.82rem">'
+                        f'✅ <b>{info["label"]}</b> cargada<br>'
+                        f'📄 {actual.get("nombre_archivo","")}<br>'
+                        f'<span style="color:#6b7280">Indexada: {actual.get("fecha_carga","")} · '
+                        f'{actual.get("caracteres",0):,} caracteres</span></div>'.replace(",", "."),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="card-warn" style="color:#1e293b!important;font-size:.82rem">'
+                        f'⭕ <b>{info["label"]}</b> — sin cargar todavía</div>',
+                        unsafe_allow_html=True,
+                    )
+                norma_file = st.file_uploader(
+                    f"{'🔁 Reemplazar' if actual else '⬆️ Subir'} {info['label']}",
+                    type=["pdf", "docx", "txt"], key=f"norma_up_{norma_key}",
+                )
+                if norma_file:
+                    with st.spinner(f"Procesando e indexando {info['label']} como documento madre..."):
+                        res = _guardar_norma_iso(norma_key, norma_file.getvalue(), norma_file.name)
+                    if res and res.get("caracteres", 0) > 0:
+                        st.success(f"✅ {info['label']} indexada correctamente "
+                                   f"({res['caracteres']:,} caracteres).".replace(",", "."))
+                        st.rerun()
+                    else:
+                        st.error("⚠️ No se pudo extraer texto del archivo. Probá con otro formato (PDF con texto seleccionable o DOCX).")
+
     if not lista_maestra:
         st.markdown('<div class="card-info" style="color:#1e293b!important">👆 Suba documentos del SGI '
                     'para activar el chatbot con RAG.</div>', unsafe_allow_html=True)
@@ -3691,9 +3853,11 @@ def tab_chatbot(lista_maestra: list):
                 f'<div class="card-info" style="color:#1e293b!important">'
                 f'💡 <b style="color:#1a237e;">Chatbot activo.</b> '
                 f'Tengo <b>{len([d for d in lista_maestra if d.get("estado","activo")=="activo"])}</b> '
-                f'documento(s) activo(s) indexado(s).<br>'
+                f'documento(s) activo(s) indexado(s)'
+                f'{" y el <b>texto oficial de " + " e ".join(NORMAS_INFO[k]["label"] for k in registry) + "</b> como documento madre" if registry else ""}.<br>'
                 f'Realizá una consulta sobre el Manual o las normas ISO, procedimientos, '
-                f'indicadores, auditorías internas o gestión de riesgos viales.</div>',
+                f'indicadores, auditorías internas, gestión de riesgos viales, o pedime que '
+                f'<b>compare un documento contra la norma</b>.</div>',
                 unsafe_allow_html=True,
             )
         for msg in st.session_state.get("messages",[]):
