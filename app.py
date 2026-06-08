@@ -58,7 +58,9 @@ INDICADORES_PATH     = _DATA_DIR / "indicadores_sgi.json"
 RIESGOS_PATH         = _DATA_DIR / "riesgos_sectores.json"
 CHECKLIST_PATH       = _DATA_DIR / "checklist_cargas.json"
 CHROMA_PATH          = str(_DATA_DIR / "chroma_db")  # compartido junto a los datos
-CHROMA_COLLECTION    = "sgi_documentos"
+# v2: nueva colección porque cambia la dimensionalidad del vector al pasar de
+# sentence-transformers (384) a la API de embeddings de Gemini (768)
+CHROMA_COLLECTION    = "sgi_documentos_v2"
 
 # Carpetas de archivos físicos en Drive
 DOCS_ACTIVOS_PATH   = _DATA_DIR / "documentos" / "activos"
@@ -342,11 +344,67 @@ def save_json(path: Path, data) -> bool:
         return False
 
 # ─── CHROMADB + EMBEDDINGS ────────────────────────────────────────────────────
+# Embeddings vía API de Gemini (en vez de sentence-transformers/PyTorch local):
+# no carga ningún modelo en memoria — ideal para hosting con RAM limitada (Render).
+class GeminiEmbeddingFunction:
+    """Función de embeddings liviana basada en la API de Gemini.
+    Usa task_type asimétrico (RETRIEVAL_DOCUMENT al indexar, RETRIEVAL_QUERY al buscar)
+    para mejorar la calidad de la búsqueda semántica."""
+    _MODEL = "gemini-embedding-001"
+    _DIM   = 768
+
+    def __init__(self, api_key: str = ""):
+        self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        self._client  = None
+
+    def _get_client(self):
+        if self._client is None and self._api_key:
+            try:
+                from google import genai
+                self._client = genai.Client(api_key=self._api_key)
+            except Exception:
+                self._client = None
+        return self._client
+
+    def _embed(self, texts: list, task_type: str) -> list:
+        client = self._get_client()
+        if client is None:
+            return [[0.0] * self._DIM for _ in texts]
+        from google.genai import types
+        out, BATCH = [], 20
+        for i in range(0, len(texts), BATCH):
+            batch = [(t or " ")[:8000] for t in texts[i:i + BATCH]]
+            try:
+                resp = client.models.embed_content(
+                    model=self._MODEL, contents=batch,
+                    config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=self._DIM),
+                )
+                out.extend([list(e.values) for e in resp.embeddings])
+            except Exception:
+                out.extend([[0.0] * self._DIM for _ in batch])
+        return out
+
+    def __call__(self, input):
+        return self._embed(list(input), "RETRIEVAL_DOCUMENT")
+
+    def embed_query(self, input):
+        return self._embed(list(input), "RETRIEVAL_QUERY")
+
+    def name(self):
+        return self._MODEL
+
+    @staticmethod
+    def build_from_config(config):
+        return GeminiEmbeddingFunction(config.get("api_key", ""))
+
+    def get_config(self):
+        return {"api_key": self._api_key}
+
+
 @st.cache_resource(show_spinner=False)
 def _init_chroma():
     import chromadb
-    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-    ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    ef = GeminiEmbeddingFunction(os.environ.get("GEMINI_API_KEY", ""))
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     return client.get_or_create_collection(
         name=CHROMA_COLLECTION, embedding_function=ef,
@@ -1315,6 +1373,40 @@ def index_document(file_bytes: bytes, filename: str, text: str) -> None:
     meta = [{"source":filename,"chunk_idx":i,"hash":fhash} for i in range(len(chunks))]
     try: col.upsert(documents=chunks, ids=ids, metadatas=meta)
     except Exception as e: st.warning(f"ChromaDB: {e}")
+
+
+def reindex_documentos(lista_maestra: list, analisis_cache: dict) -> int:
+    """Reindexa los documentos activos (y las normas oficiales cargadas) en ChromaDB
+    usando el motor de embeddings configurado. Útil tras cambiar de motor de búsqueda
+    (p.ej. al pasar de sentence-transformers local a la API de Gemini)."""
+    n = 0
+    for doc in lista_maestra:
+        if doc.get("estado", "activo") != "activo":
+            continue
+        nombre = doc.get("nombre", "")
+        texto  = (analisis_cache.get(nombre, {}) or {}).get("_texto", "")
+        if not texto:
+            continue
+        fhash  = doc.get("hash") or hashlib.md5(nombre.encode()).hexdigest()[:8]
+        chunks = chunk_text(texto)
+        if not chunks:
+            continue
+        ids  = [f"{fhash}_{i}" for i in range(len(chunks))]
+        meta = [{"source": nombre, "chunk_idx": i, "hash": fhash} for i in range(len(chunks))]
+        try:
+            get_collection().upsert(documents=chunks, ids=ids, metadatas=meta)
+            n += 1
+        except Exception as e:
+            st.warning(f"Error reindexando {nombre}: {e}")
+    # Re-indexar también las normas oficiales (documento madre), si las hay
+    for norma_key, info in cargar_normas_registry().items():
+        p = Path(info.get("archivo_path", ""))
+        if p.exists():
+            try:
+                _guardar_norma_iso(norma_key, p.read_bytes(), p.name)
+            except Exception as e:
+                st.warning(f"Error reindexando norma {norma_key}: {e}")
+    return n
 
 
 # ─── NORMAS OFICIALES (DOCUMENTO MADRE) ───────────────────────────────────────
@@ -3080,7 +3172,7 @@ def tab_sgi_operativo(lista_maestra: list, analisis_cache: dict):
 
 
 # ─── SIDEBAR ──────────────────────────────────────────────────────────────────
-def render_sidebar(lista_maestra: list, incongruencias: dict):
+def render_sidebar(lista_maestra: list, incongruencias: dict, analisis_cache: dict):
     with st.sidebar:
         st.markdown("### 🏛️ SGI Asistente v3")
         st.markdown("---")
@@ -3111,6 +3203,20 @@ def render_sidebar(lista_maestra: list, incongruencias: dict):
             unsafe_allow_html=True)
         if st.button("🔄 Sincronizar ahora", use_container_width=True, key="btn_sync"):
             st.session_state["_data_mtime"] = 0   # fuerza re-lectura
+            st.rerun()
+        try:    n_chunks_actual = get_collection().count()
+        except: n_chunks_actual = 0
+        if n_chunks_actual == 0 and any(d.get("estado","activo")=="activo" for d in lista_maestra):
+            st.markdown(
+                '<div style="font-size:.71rem;color:#fde68a;background:rgba(245,158,11,.15);'
+                'border-radius:6px;padding:6px 10px;margin:4px 0">'
+                '⚠️ El índice de búsqueda está vacío. Reindexá para que el chatbot '
+                'encuentre los documentos ya cargados.</div>', unsafe_allow_html=True)
+        if st.button("🔁 Reindexar búsqueda (RAG)", use_container_width=True, key="btn_reindex",
+                     help="Reconstruye el índice semántico de búsqueda con el motor de embeddings actual (Gemini API)"):
+            with st.spinner("Reindexando documentos y normas oficiales…"):
+                n = reindex_documentos(lista_maestra, analisis_cache)
+            st.success(f"✅ {n} documento(s) reindexado(s).")
             st.rerun()
         st.markdown("---")
         st.markdown("### 📊 Estado del Sistema")
@@ -3973,7 +4079,7 @@ def main():
     analisis_cache: dict = load_json(ANALISIS_PATH, {})
     incongruencias: dict = load_incongruencias(analisis_cache)
 
-    render_sidebar(lista_maestra, incongruencias)
+    render_sidebar(lista_maestra, incongruencias, analisis_cache)
 
     # Header con KPIs
     activos = [d for d in lista_maestra if d.get("estado","activo")=="activo"]
