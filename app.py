@@ -3071,6 +3071,70 @@ def tab_auditoria(lista_maestra: list, analisis_cache: dict):
                     st.session_state.pop(f"imp_chk_{idx}", None)
                 st.rerun()
 
+    with ht4:
+        st.markdown('<div class="card-info" style="color:#1e293b!important;font-size:.84rem">'
+                    '💡 Generá un <b>Checklist de Auditoría</b> automático basado en los procedimientos de tu Lista Maestra.</div>',
+                    unsafe_allow_html=True)
+                    
+        doc_seleccionado = st.selectbox("Seleccioná el Documento a auditar:", 
+                                        [""] + [d["nombre"] for d in activos], 
+                                        key="chk_doc_sel")
+        
+        if doc_seleccionado:
+            doc_data = next((d for d in activos if d["nombre"] == doc_seleccionado), None)
+            analisis = analisis_cache.get(doc_seleccionado, {})
+            
+            if not analisis:
+                st.warning("Este documento aún no tiene un análisis generado. Por favor, generá el análisis en la pestaña de Repositorio o Documentos.")
+            else:
+                resumen = analisis.get("resumen_ejecutivo", "")
+                st.write(f"**Normas Asociadas:** ISO 9001: {doc_data.get('iso9001','')} | ISO 39001: {doc_data.get('iso39001','')}")
+                
+                if st.button("✨ Generar Checklist Automático", type="primary"):
+                    with st.spinner("Generando checklist con Gemini..."):
+                        prompt = f"""
+                        Actúa como un Auditor Líder experto en ISO 9001 e ISO 39001.
+                        Se va a auditar el siguiente documento: "{doc_seleccionado}".
+                        
+                        Aquí tienes un resumen de su contenido:
+                        {resumen}
+                        
+                        Normas aplicables según metadatos:
+                        ISO 9001: {doc_data.get('iso9001','')}
+                        ISO 39001: {doc_data.get('iso39001','')}
+                        
+                        Tu tarea es generar un **Checklist de Auditoría Interna** con 5 a 10 preguntas cerradas o abiertas MUY ESPECÍFICAS sobre este documento.
+                        No hagas preguntas genéricas, básate en el resumen. 
+                        
+                        Formato de salida (Markdown):
+                        ### Checklist de Auditoría: {doc_seleccionado}
+                        - [ ] **Pregunta 1:** [Pregunta]
+                        - [ ] **Pregunta 2:** [Pregunta]
+                        ...
+                        
+                        Agrega una sección final de "Recomendaciones para el auditor" con 2 o 3 puntos clave a observar in situ.
+                        """
+                        
+                        try:
+                            # Utilizar la función _call_gemini ya existente en el código
+                            checklist_text = _call_gemini(prompt)
+                            if checklist_text:
+                                st.session_state[f"chk_gen_{doc_seleccionado}"] = checklist_text
+                        except Exception as e:
+                            st.error(f"Error generando checklist: {e}")
+                            
+            if st.session_state.get(f"chk_gen_{doc_seleccionado}"):
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown('<div style="background:#fff; padding:20px; border-radius:12px; border:1px solid #e5e7eb;">' + 
+                            st.session_state[f"chk_gen_{doc_seleccionado}"] + '</div>', unsafe_allow_html=True)
+                
+                st.download_button(
+                    label="💾 Descargar Checklist (TXT)",
+                    data=st.session_state[f"chk_gen_{doc_seleccionado}"],
+                    file_name=f"Checklist_Auditoria.txt",
+                    mime="text/plain"
+                )
+
 
 # ─── TAB: SGI OPERATIVO ───────────────────────────────────────────────────────
 def tab_sgi_operativo(lista_maestra: list, analisis_cache: dict):
@@ -3952,7 +4016,37 @@ def tab_revisiones(lista_maestra: list, analisis_cache: dict):
 # ─── TAB: INCONGRUENCIAS ──────────────────────────────────────────────────────
 def tab_incongruencias(lista_maestra: list, analisis_cache: dict, incongruencias: dict):
     st.markdown('<p class="sec-title">⚠️ Gestión de Incongruencias</p>', unsafe_allow_html=True)
-
+    
+    activos = [d["nombre"] for d in lista_maestra if d.get("estado","activo")=="activo"]
+    
+    if st.button("🔍 Escanear Referencias Obsoletas Cruzadas", help="Busca en todos los documentos activos si mencionan a algún documento que ya está obsoleto."):
+        with st.spinner("Escaneando referencias cruzadas..."):
+            obsoletos = [d["nombre"] for d in lista_maestra if d.get("estado") == "obsoleto"]
+            if not obsoletos:
+                st.info("No hay documentos obsoletos para buscar.")
+            else:
+                nuevas_incongruencias = 0
+                for doc_activo in activos:
+                    texto_doc = analisis_cache.get(doc_activo, {}).get("_texto", "")
+                    if not texto_doc:
+                        continue
+                    
+                    for obs in obsoletos:
+                        if obs.lower() in texto_doc.lower():
+                            detalle = f"ALERTA DE OBSOLESCENCIA CRUZADA: El documento activo menciona a '{obs}' el cual está marcado como obsoleto en la Lista Maestra."
+                            if not _incongruencia_ya_existe(detalle, incongruencias, doc_activo):
+                                incongruencias = add_incongruencia_from_analysis(doc_activo, detalle, incongruencias)
+                                nuevas_incongruencias += 1
+                
+                if nuevas_incongruencias > 0:
+                    save_incongruencias(incongruencias)
+                    st.success(f"Se detectaron {nuevas_incongruencias} nuevas referencias obsoletas. Se han agregado a la lista.")
+                    import time; time.sleep(1.5)
+                    st.rerun()
+                else:
+                    st.success("No se encontraron referencias a documentos obsoletos en los documentos activos.")
+                    
+    st.markdown("<hr style='margin:8px 0;border-color:#e5e7eb!important'>", unsafe_allow_html=True)
     activos = [d["nombre"] for d in lista_maestra if d.get("estado","activo")=="activo"]
     all_items = [v for v in incongruencias.values() if v.get("estado") != "eliminada"]
 
@@ -4296,6 +4390,64 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                         save_json(LISTA_MAESTRA_PATH, lista_maestra)
                         st.success(f"**{doc['nombre']}** restaurado como activo."); st.rerun()
                 st.markdown("<hr style='margin:8px 0;border-color:#e5e7eb!important'>", unsafe_allow_html=True)
+
+    with sub3:
+        st.markdown('<div class="card-info" style="color:#1e293b!important;font-size:.84rem">'
+                    '💡 Generá un <b>Flujograma en código Mermaid</b> a partir de los procedimientos activos para visualizar rápidamente los pasos.</div>',
+                    unsafe_allow_html=True)
+                    
+        procedimientos = [d for d in activos if d.get("tipo") == "Procedimiento" or d.get("tipo") == "Instructivo"]
+        if not procedimientos:
+            st.warning("No se encontraron documentos de tipo 'Procedimiento' o 'Instructivo' activos. Puedes cambiar el tipo desde la Lista Maestra.")
+        else:
+            proc_seleccionado = st.selectbox("Seleccioná el Procedimiento a transformar en Flujograma:", 
+                                            [""] + [d["nombre"] for d in procedimientos], 
+                                            key="flow_proc_sel")
+            
+            if proc_seleccionado:
+                analisis = analisis_cache.get(proc_seleccionado, {})
+                if not analisis:
+                    st.warning("El documento seleccionado no tiene un análisis generado aún.")
+                else:
+                    resumen = analisis.get("resumen_ejecutivo", "")
+                    
+                    if st.button("✨ Generar Flujograma (Mermaid)", type="primary"):
+                        with st.spinner("Generando código Mermaid con Gemini..."):
+                            prompt = f"""
+                            Actúa como un analista de procesos experto. 
+                            Voy a darte el resumen de un procedimiento: "{proc_seleccionado}".
+                            Tu tarea es extraer los pasos principales y generar el código de un diagrama de flujo en **Mermaid.js**.
+                            
+                            Resumen del procedimiento:
+                            {resumen}
+                            
+                            Instrucciones estrictas para la salida:
+                            - Devuelve SOLO el bloque de código Mermaid.
+                            - Usa `graph TD` o `flowchart TD`.
+                            - Mantén los textos de los nodos cortos y concisos.
+                            - Utiliza decisiones (rombos) si es apropiado.
+                            - NO agregues texto explicativo antes ni después del bloque de código.
+                            """
+                            
+                            try:
+                                flowchart_code = _call_gemini(prompt)
+                                if flowchart_code:
+                                    if flowchart_code.startswith("```mermaid"):
+                                        flowchart_code = flowchart_code[10:]
+                                    elif flowchart_code.startswith("```"):
+                                        flowchart_code = flowchart_code[3:]
+                                    if flowchart_code.endswith("```"):
+                                        flowchart_code = flowchart_code[:-3]
+                                        
+                                    st.session_state[f"flow_gen_{proc_seleccionado}"] = flowchart_code.strip()
+                            except Exception as e:
+                                st.error(f"Error generando flujograma: {e}")
+                                
+                if st.session_state.get(f"flow_gen_{proc_seleccionado}"):
+                    code = st.session_state[f"flow_gen_{proc_seleccionado}"]
+                    st.markdown("### Código Mermaid Generado")
+                    st.markdown("Copiá este código y pegalo en [Mermaid Live Editor](https://mermaid.live/) para visualizarlo o incluilo en reportes.")
+                    st.code(code, language="mermaid")
 
 
 # ─── TAB: CREAR DOCUMENTO ────────────────────────────────────────────────────
@@ -4693,6 +4845,12 @@ def main():
     with tab10:
         st.markdown("<br>", unsafe_allow_html=True)
         tab_sgi_operativo(lista_maestra, analisis_cache)
+    with tab11:
+        st.markdown("<br>", unsafe_allow_html=True)
+        tab_gap_analysis(lista_maestra, analisis_cache)
+    with tab12:
+        st.markdown("<br>", unsafe_allow_html=True)
+        tab_formularios_digitales()
 
 
 if __name__ == "__main__":
