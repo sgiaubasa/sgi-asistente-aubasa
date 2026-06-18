@@ -300,15 +300,19 @@ section[data-testid="stSidebar"] h3 { color:#e0f7fa !important; font-size:.85rem
 .card-warn { background:#fffbf0; border-left:4px solid #f59e0b;
     padding:12px 16px; border-radius:0 14px 14px 0; margin-bottom:12px;
     box-shadow:0 2px 8px rgba(245,158,11,.1); color:#1e293b !important; }
+.card-warn *, .card-warn p, .card-warn span, .card-warn div, .card-warn strong, .card-warn b, .card-warn li { color:#1e293b !important; }
 .card-ok   { background:#f0fdf4; border-left:4px solid #22c55e;
     padding:12px 16px; border-radius:0 14px 14px 0; margin-bottom:12px;
     box-shadow:0 2px 8px rgba(34,197,94,.1); color:#1e293b !important; }
+.card-ok *, .card-ok p, .card-ok span, .card-ok div, .card-ok strong, .card-ok b, .card-ok li { color:#1e293b !important; }
 .card-info { background:#f0fbfb; border-left:4px solid #00A9C0;
     padding:12px 16px; border-radius:0 14px 14px 0; margin-bottom:12px;
     box-shadow:0 2px 8px rgba(0,169,192,.1); color:#1e293b !important; }
+.card-info *, .card-info p, .card-info span, .card-info div, .card-info strong, .card-info b, .card-info li { color:#1e293b !important; }
 .card-danger { background:#fff1f2; border-left:4px solid #ef4444;
     padding:12px 16px; border-radius:0 14px 14px 0; margin-bottom:12px;
     box-shadow:0 2px 8px rgba(239,68,68,.1); color:#1e293b !important; }
+.card-danger *, .card-danger p, .card-danger span, .card-danger div, .card-danger strong, .card-danger b, .card-danger li { color:#1e293b !important; }
 
 .verdict { display:inline-flex; align-items:center; gap:6px; padding:8px 20px;
     border-radius:999px; font-weight:800; font-size:1.05rem; letter-spacing:.3px; margin-bottom:14px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
@@ -2723,7 +2727,7 @@ def tab_auditoria(lista_maestra: list, analisis_cache: dict):
     st.markdown('<p class="sec-title">🔍 Auditoría Interna — Registro de Hallazgos</p>',
                 unsafe_allow_html=True)
 
-    ht1, ht2, ht3 = st.tabs(["📋  Registro de Hallazgos","➕  Nuevo Hallazgo","📤  Importar desde Informe"])
+    ht1, ht2, ht3, ht4 = st.tabs(["📋  Registro de Hallazgos","➕  Nuevo Hallazgo","📤  Importar desde Informe", "✅  Checklist Inteligente"])
 
     # ── LISTADO ───────────────────────────────────────────────────────────────
     with ht1:
