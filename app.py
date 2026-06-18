@@ -979,6 +979,15 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
             return re.sub(r'\s+', ' ', text).strip()
         if ext == ".txt":
             return file_bytes.decode("utf-8", errors="ignore")
+        if ext in (".jpg", ".jpeg", ".png"):
+            st.info("📷 Imagen detectada — aplicando OCR con Gemini Vision…")
+            ocr_text = ocr_with_gemini(file_bytes, filename)
+            if ocr_text:
+                st.success("✅ OCR completado correctamente.")
+                return ocr_text
+            else:
+                st.error("❌ No se pudo extraer texto de la imagen.")
+                return ""
     except Exception as e:
         st.error(f"Error extrayendo '{filename}': {e}")
     return ""
@@ -3720,9 +3729,9 @@ def tab_documentos(lista_maestra: list, analisis_cache: dict, incongruencias: di
                 'El análisis se calcula <b>una sola vez</b> y queda guardado localmente.</div>',
                 unsafe_allow_html=True)
     uploaded = st.file_uploader("Seleccione o arrastre un documento",
-                                type=["pdf","docx","xlsx","html","htm","txt"],
+                                type=["pdf","docx","xlsx","html","htm","txt","jpg","jpeg","png"],
                                 key="main_uploader",
-                                help="PDF, Word, Excel, HTML (indicadores), TXT")
+                                help="PDF, Word, Excel, HTML, TXT, Imágenes (JPG, PNG)")
     if uploaded is None: return lista_maestra, analisis_cache, incongruencias
 
     file_bytes = uploaded.getvalue()
@@ -4136,23 +4145,52 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
                             '<div style="background:#eff6ff;border:1px dashed #3b82f6;border-radius:8px;'
                             'padding:12px 16px;margin:6px 0">'
                             '<div style="font-size:.82rem;color:#1d4ed8;font-weight:600;margin-bottom:6px">'
-                            '📎 Subí el archivo para vincularlo (sin re-analizar)</div>',
+                            '📎 Subí el archivo para vincularlo y analizarlo</div>',
                             unsafe_allow_html=True)
                         vin_file = st.file_uploader(
                             "Seleccioná el archivo",
-                            type=["pdf","docx","xlsx","txt"],
+                            type=["pdf","docx","xlsx","txt","jpg","jpeg","png"],
                             key=f"vin_up_{doc['hash']}",
                             label_visibility="collapsed"
                         )
                         if vin_file:
-                            arch = _guardar_archivo_doc(vin_file.getvalue(), vin_file.name)
-                            for i, d in enumerate(lista_maestra):
-                                if d.get("hash") == doc["hash"]:
-                                    lista_maestra[i]["archivo_path"] = arch or ""
-                                    break
+                            file_bytes = vin_file.getvalue()
+                            arch = _guardar_archivo_doc(file_bytes, vin_file.name)
+                            
+                            st.info("Analizando documento vinculado...")
+                            text = extract_text(file_bytes, vin_file.name)
+                            if text.strip():
+                                classification = classify_document(text, vin_file.name)
+                                deep = analyze_document_deep(text, vin_file.name)
+                                index_document(file_bytes, vin_file.name, text)
+                                
+                                analisis_cache[vin_file.name] = {**deep, "_texto": text[:TEXT_PREVIEW_LEN]}
+                                save_json(ANALISIS_PATH, analisis_cache)
+                                
+                                incs = load_json(INCONGRUENCIAS_PATH, {})
+                                for inc_txt in deep.get("incongruencias", []):
+                                    if inc_txt and not any(p in inc_txt for p in ["⚠️","📌","Error","Configure"]):
+                                        if not _incongruencia_ya_existe(inc_txt, incs, vin_file.name):
+                                            incs = add_incongruencia_from_analysis(vin_file.name, inc_txt, incs)
+                                save_incongruencias(incs)
+                                
+                                for i, d in enumerate(lista_maestra):
+                                    if d.get("hash") == doc["hash"]:
+                                        lista_maestra[i]["archivo_path"] = arch or ""
+                                        lista_maestra[i]["tipo"] = classification.get("tipo", d.get("tipo"))
+                                        lista_maestra[i]["iso9001"] = classification.get("iso9001", d.get("iso9001"))
+                                        lista_maestra[i]["iso39001"] = classification.get("iso39001", d.get("iso39001"))
+                                        break
+                                st.success(f"✅ Archivo vinculado y analizado correctamente.")
+                            else:
+                                for i, d in enumerate(lista_maestra):
+                                    if d.get("hash") == doc["hash"]:
+                                        lista_maestra[i]["archivo_path"] = arch or ""
+                                        break
+                                st.warning(f"✅ Archivo vinculado, pero no se pudo extraer texto para analizar.")
+                                
                             save_json(LISTA_MAESTRA_PATH, lista_maestra)
                             st.session_state.pop(f"vincular_{doc['hash']}", None)
-                            st.success(f"✅ Archivo vinculado correctamente.")
                             st.rerun()
                         st.markdown('</div>', unsafe_allow_html=True)
 
