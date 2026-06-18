@@ -501,13 +501,13 @@ def save_json(path: Path, data) -> bool:
             }).execute()
             return True
         except Exception as e:
-            st.error(f"Error guardando '{path.stem}' en Supabase: {e}")
-            return False
+            print(f"[Supabase] save_json('{path.stem}'): {e}")
+            # si falla, intentamos el filesystem como respaldo (sigue abajo)
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return True
     except Exception as e:
-        st.error(f"Error guardando {path.name}: {e}")
+        st.error(f"Error guardando localmente {path.name}: {e}")
         return False
 
 # ─── CHROMADB + EMBEDDINGS ────────────────────────────────────────────────────
