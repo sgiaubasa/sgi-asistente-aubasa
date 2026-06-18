@@ -314,6 +314,10 @@ section[data-testid="stSidebar"] h3 { color:#e0f7fa !important; font-size:.85rem
     box-shadow:0 2px 8px rgba(239,68,68,.1); color:#1e293b !important; }
 .card-danger *, .card-danger p, .card-danger span, .card-danger div, .card-danger strong, .card-danger b, .card-danger li { color:#1e293b !important; }
 
+section[data-testid="stSidebar"] .card-info *, section[data-testid="stSidebar"] .card-warn *, section[data-testid="stSidebar"] .card-ok *, section[data-testid="stSidebar"] .card-danger * {
+    color: #1e293b !important;
+}
+
 .verdict { display:inline-flex; align-items:center; gap:6px; padding:8px 20px;
     border-radius:999px; font-weight:800; font-size:1.05rem; letter-spacing:.3px; margin-bottom:14px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
 .verdict-ok  { background:#dcfce7; color:#15803d; border:2px solid #22c55e; }
@@ -4806,7 +4810,7 @@ def main():
         st.markdown("---")
         render_right_panel(lista_maestra, analisis_cache)
 
-    tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10 = st.tabs([
+    tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10,tab11,tab12 = st.tabs([
         "📂  Documentos",
         "📋  Lista Maestra",
         "🔄  Revisiones",
@@ -4817,6 +4821,8 @@ def main():
         "📝  Crear Doc",
         "💬  Chatbot",
         "🎯  SGI Operativo",
+        "📊  Gap Analysis",
+        "📝  Formularios",
     ])
     with tab1:
         st.markdown("<br>", unsafe_allow_html=True)
