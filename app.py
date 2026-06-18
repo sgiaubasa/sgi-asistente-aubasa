@@ -282,12 +282,12 @@ section[data-testid="stSidebar"] h3 { color:#e0f7fa !important; font-size:.85rem
 }
 
 .kpi-row { display:flex; gap:12px; margin-top:20px; flex-wrap:wrap; }
-.kpi-badge { background:rgba(255,255,255,.15); backdrop-filter:blur(8px);
-    border:1px solid rgba(255,255,255,.3); border-radius:14px; padding:10px 18px;
-    color:white; min-width:100px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); transition:transform 0.2s; }
-.kpi-badge:hover { transform: translateY(-2px); }
-.kpi-badge .kv { font-size:1.5rem; font-weight:800; display:block; line-height:1.1; margin-bottom:2px;}
-.kpi-badge .kl { font-size:.7rem; opacity:.9; text-transform:uppercase; letter-spacing:.6px; font-weight:600;}
+.kpi-badge { background:white;
+    border:1px solid #e2e8f0; border-radius:14px; padding:10px 18px;
+    color:#1e293b; min-width:100px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); transition:transform 0.2s; }
+.kpi-badge:hover { transform: translateY(-2px); border-color:#00A9C0; }
+.kpi-badge .kv { font-size:1.5rem; font-weight:800; display:block; line-height:1.1; margin-bottom:2px; color:#00A9C0;}
+.kpi-badge .kl { font-size:.7rem; color:#64748b; text-transform:uppercase; letter-spacing:.6px; font-weight:700;}
 
 .sec-title { display:flex; align-items:center; gap:8px; font-size:1rem; font-weight:800;
     color:#007a8c; border-left:5px solid #00A9C0; padding-left:12px; margin:0 0 16px 0; }
@@ -4190,7 +4190,7 @@ def tab_repositorio(lista_maestra: list, analisis_cache: dict):
     activos   = [d for d in lista_maestra if d.get("estado","activo")=="activo"]
     obsoletos = [d for d in lista_maestra if d.get("estado","activo")=="obsoleto"]
 
-    sub1, sub2 = st.tabs(["✅  Documentos Activos","🗂️  Documentos Obsoletos"])
+    sub1, sub2, sub3 = st.tabs(["✅  Documentos Activos","🗂️  Documentos Obsoletos", "📊  Flujogramas (Mermaid)"])
 
     with sub1:
         if not activos:
