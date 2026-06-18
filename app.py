@@ -4810,7 +4810,7 @@ def main():
         st.markdown("---")
         render_right_panel(lista_maestra, analisis_cache)
 
-    tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10,tab11,tab12 = st.tabs([
+    tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10 = st.tabs([
         "📂  Documentos",
         "📋  Lista Maestra",
         "🔄  Revisiones",
@@ -4821,8 +4821,6 @@ def main():
         "📝  Crear Doc",
         "💬  Chatbot",
         "🎯  SGI Operativo",
-        "📊  Gap Analysis",
-        "📝  Formularios",
     ])
     with tab1:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -4855,12 +4853,6 @@ def main():
     with tab10:
         st.markdown("<br>", unsafe_allow_html=True)
         tab_sgi_operativo(lista_maestra, analisis_cache)
-    with tab11:
-        st.markdown("<br>", unsafe_allow_html=True)
-        tab_gap_analysis(lista_maestra, analisis_cache)
-    with tab12:
-        st.markdown("<br>", unsafe_allow_html=True)
-        tab_formularios_digitales()
 
 
 if __name__ == "__main__":
